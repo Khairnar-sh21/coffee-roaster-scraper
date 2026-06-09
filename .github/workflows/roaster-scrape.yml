@@ -1,0 +1,40 @@
+name: Roaster Scrape
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 12 * * 1"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+      AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+      PRODUCTS_TABLE_NAME: ${{ vars.PRODUCTS_TABLE_NAME }}
+      ROASTERS_TABLE_NAME: ${{ vars.ROASTERS_TABLE_NAME }}
+      ROASTER_NAME_FIELD: ${{ vars.ROASTER_NAME_FIELD }}
+      BASE_URL_FIELD: ${{ vars.BASE_URL_FIELD }}
+      WEB_SCRAPING_FIELD: ${{ vars.WEB_SCRAPING_FIELD }}
+      PLATFORM_USED_FIELD: ${{ vars.PLATFORM_USED_FIELD }}
+      DRY_RUN: ${{ vars.DRY_RUN }}
+      REPLACE_ROASTER_PRODUCTS_EACH_RUN: ${{ vars.REPLACE_ROASTER_PRODUCTS_EACH_RUN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        run: python Coffee_Roaster_Website_Scrapper

@@ -1,0 +1,2901 @@
+import os
+import requests
+import xml.etree.ElementTree as ET
+from pyairtable import Api
+import html as _html_stdlib
+import re
+from urllib.parse import urlparse, urlunparse
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+def _canonical_roaster_host(store_url):
+    """
+    Normalize website host for matching roasters (e.g. www vs non-www).
+    Used so WordPress trace detection matches Airtable URL to the same site.
+    """
+    if not store_url:
+        return ''
+    u = str(store_url).strip().rstrip('/')
+    if not u.startswith('http'):
+        u = 'https://' + u
+    try:
+        p = urlparse(u)
+        host = (p.netloc or '').lower()
+        if host.startswith('www.'):
+            host = host[4:]
+        return host
+    except Exception:
+        return ''
+
+
+def _sanitize_url_for_parsing(url):
+    """
+    Sanitize raw URL strings extracted from sitemaps/regex scans.
+
+    Some hosts/sitemap formats include stray characters (e.g. a trailing ']' from
+    regex matches). Those can make urlparse raise ValueError (e.g. invalid IPv6).
+    """
+    if url is None:
+        return ''
+    s = str(url).strip()
+    if not s:
+        return ''
+    # Trim common stray trailing delimiters that appear in sitemap/regex text.
+    s = s.rstrip(']}>).,;')
+    s = s.rstrip('([')
+    return s
+
+
+def _safe_url_path_lower(url):
+    """
+    urlparse wrapper that never throws; returns '' on failure.
+    """
+    s = _sanitize_url_for_parsing(url)
+    if not s:
+        return ''
+    try:
+        return urlparse(s).path.lower()
+    except ValueError:
+        return ''
+
+
+def _normalize_store_base_url(store_url):
+    """
+    Normalize roaster base URLs from Airtable so scraper endpoint composition stays valid.
+
+    - Removes query params/fragments (e.g. ?srsltid=..., #section)
+    - Preserves scheme + host (+ subpath if intentionally present)
+    - Trims trailing slash
+    """
+    s = _sanitize_url_for_parsing(store_url)
+    if not s:
+        return ''
+    if not s.startswith(('http://', 'https://')):
+        s = 'https://' + s
+    try:
+        p = urlparse(s)
+    except ValueError:
+        return ''
+    if not p.netloc:
+        return ''
+    path = (p.path or '').rstrip('/')
+    if path == '/':
+        path = ''
+    normalized = urlunparse((p.scheme or 'https', p.netloc, path, '', '', ''))
+    return normalized.rstrip('/')
+try:
+    from bs4 import BeautifulSoup
+except Exception as _e:
+    BeautifulSoup = None
+    _BS4_IMPORT_ERROR = _e
+
+# ==========================================
+# 1. AIRTABLE CONFIG (from environment)
+# ==========================================
+# SECURITY: never commit real credentials. Copy .env.example to .env locally, or use
+# GitHub Actions Secrets for automation. If a token was ever committed, rotate it in Airtable.
+
+
+def _env_flag(name, default='false'):
+    return os.environ.get(name, default).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _require_env(name):
+    value = os.environ.get(name, '').strip()
+    if not value:
+        raise RuntimeError(
+            f'Missing required environment variable: {name}. '
+            'Copy .env.example to .env and fill in your values.'
+        )
+    return value
+
+
+AIRTABLE_TOKEN = _require_env('AIRTABLE_TOKEN')
+BASE_ID = _require_env('AIRTABLE_BASE_ID')
+
+# Table where all coffee products from all roasters are stored.
+PRODUCTS_TABLE_NAME = os.environ.get('PRODUCTS_TABLE_NAME', 'Products').strip() or 'Products'
+
+# Table where you list roasters to scrape.
+ROASTERS_TABLE_NAME = os.environ.get('ROASTERS_TABLE_NAME', 'Roasters').strip() or 'Roasters'
+ROASTER_NAME_FIELD = os.environ.get('ROASTER_NAME_FIELD', 'Name').strip() or 'Name'
+BASE_URL_FIELD = os.environ.get('BASE_URL_FIELD', 'Website URL').strip() or 'Website URL'
+WEB_SCRAPING_FIELD = os.environ.get('WEB_SCRAPING_FIELD', 'Web Scraping').strip() or 'Web Scraping'
+PLATFORM_USED_FIELD = os.environ.get('PLATFORM_USED_FIELD', 'Platform Used').strip() or 'Platform Used'
+
+api = Api(AIRTABLE_TOKEN)
+products_table = api.table(BASE_ID, PRODUCTS_TABLE_NAME)
+roasters_table = api.table(BASE_ID, ROASTERS_TABLE_NAME)
+
+# Quick run/log mode:
+# Set DRY_RUN=true to avoid any Airtable writes/deletes (updates, creates, batch deletes).
+DRY_RUN = _env_flag('DRY_RUN', 'false')
+
+if DRY_RUN:
+    print('[DRY_RUN] Enabled: Airtable create/update/delete operations will be skipped.')
+
+# When True, each roaster run deletes that roaster's existing rows first, then recreates
+# the current scrape set. This keeps each roaster's products contiguous in Airtable
+# instead of appending only newly discovered products at the bottom.
+REPLACE_ROASTER_PRODUCTS_EACH_RUN = _env_flag('REPLACE_ROASTER_PRODUCTS_EACH_RUN', 'true')
+
+# Optional: restrict scraping to a subset of roasters (for testing).
+# Example: ROASTER_BASE_URL_SUBSTRING_FILTER=example.com
+_filter = os.environ.get('ROASTER_BASE_URL_SUBSTRING_FILTER', '').strip()
+ROASTER_BASE_URL_SUBSTRING_FILTER = _filter if (DRY_RUN and _filter) else None
+
+# Product type is accepted if it contains any of these (case-insensitive)
+PRODUCT_TYPE_KEYWORDS = ['coffee', 'blend', 'origin']
+
+# Shopify-only explicit product_type exclusions (global across all Shopify roasters).
+# Matching is exact after normalization (lowercase + collapsed whitespace).
+EXCLUDED_SHOPIFY_PRODUCT_TYPES = {
+    'hawaiian coffee club',
+    'espresso bites',
+    'coffee & tea sets',
+    'tea',
+    'events',
+    'supplies',
+    'brewing equipment',
+    'brew gear',
+    'equipment',
+    'candy & chocolate',
+    'candy',
+    'chocolate',
+    'merch',
+    'merchandise',
+    'tee',
+    'tees',
+    't-shirt',
+}
+
+# If these words appear in the product TITLE, the product is skipped.
+# This list is **generic** and is applied across all platforms
+# (Shopify, WooCommerce, and any others we add in future).
+EXCLUSION_TITLE_KEYWORDS = [
+    'subscription', 'decaf', 'decafinated', 'decaffeinated', 'sample',
+    # Common non-single-SKU gift/assortment product names
+    "roaster's choice",
+    'roaster choice',
+    'roaster choice box',
+    # Common non-retail / B2B / internal inventory SKUs (generic across roasters)
+    'wholesale',
+    'grocery case',
+    'grocery-case',
+    'case',          # typically appears as "... Grocery Case"
+    'green coffee',
+    'greencoffee',
+    'instant coffee',
+    'instant',
+    # Archived / RTD items should not be treated as core retail bag-coffee SKUs.
+    'archive',
+    'achive',
+    'nitro',
+    'cold brew',
+    'ready to drink',
+    'ready-to-drink',
+    'rtd',
+    ' lb batch',
+    # Non-coffee products that often have "coffee" in the name:
+    'cleaner', 'chai', 'white label', 'carafe label', 'coffee tool', 'grinder cleaner',
+    'brewer cleaner', 'machine cleaner', 'coffee server', 'travel mug', 'canister',
+    'upward', 'hario', 'pallo', 'tabz', 'puro caff', 'bunn ',
+    # Generic non-coffee items (applied to all platforms):
+    'mug', 'glasses', 'glass', 'pods', 'tumbler', 'pack', 'bundle', 'trio', 'trios',
+    # Apparel-specific terms that can show up in coffee product names.
+    'tee', 'tees', 't-shirt', 'hat', 'milk', 'machine', 'grinder',
+]
+
+# WooCommerce-only: exclude products in these categories (merch, equipment, gift cards, etc.)
+EXCLUSION_CATEGORY_KEYWORDS = [
+    'merchandise', 'merch', 'gear', 'equipment', 'gift card', 'gift-card', 'gift cards',
+    'apparel', 'clothing', 'brew equipment', 'brewing equipment',
+    # Ready-to-drink products often appear with empty product_type and can slip through fallback.
+    'rtd', 'ready to drink', 'ready-to-drink', 'nitro', 'cold brew',
+    # Apparel-specific terms that should not be treated as coffee categories.
+    'tee', 'tees', 't-shirt',
+]
+
+# ==========================================
+# 2. GENERIC HTML LABEL→VALUE PARSER (failsafe)
+# ==========================================
+# This parser is platform-agnostic: it can be used for Shopify, WooCommerce,
+# and other platforms (e.g. Squarespace) as long as the product page contains
+# structured label/value blocks like tables (<th>/<td>) or definition lists (<dt>/<dd>).
+#
+# Important safety rule:
+# - We only use extracted values if we find at least ONE "known label" on the page,
+#   to reduce the risk of pulling unrelated tables (shipping, footer, etc.).
+
+KNOWN_LABEL_SYNONYMS = {
+    # Origin
+    'origin': 'origin',
+    'country': 'origin',
+    'region': 'origin',
+    'location': 'origin',
+    'source': 'origin',
+    # Roast
+    'roast': 'roast',
+    'roast level': 'roast',
+    'roast degree': 'roast',
+    # Quantity / size
+    'weight': 'quantity',
+    'size': 'quantity',
+    'bag size': 'quantity',
+    'labeled weight': 'quantity',
+    # Grind / type (many Shopify themes use "Bean type" instead of "Grind")
+    'grind': 'grind',
+    'bean type': 'grind',
+    'beantype': 'grind',
+}
+
+
+def _normalize_label(label):
+    if not label:
+        return ''
+    s = _html_stdlib.unescape(str(label)).lower()
+    s = re.sub(r'[\s\u00A0]+', ' ', s)          # collapse whitespace
+    s = re.sub(r'[^a-z0-9 ]+', '', s).strip()   # remove punctuation
+    return s
+
+
+def _keyword_as_word_in_text(text, keyword):
+    """
+    True if keyword appears as a standalone word/phrase in text.
+    Prevents false positives like 'greencoffee' matching 'coffee'.
+    """
+    if not text or not keyword:
+        return False
+    t = str(text).lower()
+    k = str(keyword).lower().strip()
+    if not k:
+        return False
+    # Treat any non-alphanumeric boundary as a separator.
+    pat = re.compile(r'(^|[^a-z0-9])' + re.escape(k) + r'([^a-z0-9]|$)', re.I)
+    return bool(pat.search(t))
+
+
+def _normalize_product_type(product_type):
+    """Normalize product_type for exact matching."""
+    s = str(product_type or '').strip().lower()
+    return re.sub(r'\s+', ' ', s)
+
+
+def _require_bs4():
+    if BeautifulSoup is None:
+        raise RuntimeError(
+            "BeautifulSoup is required for HTML parsing but is not installed. "
+            "Install dependencies with:\n"
+            "  python3 -m pip install beautifulsoup4 lxml\n"
+            f"Original import error: {_BS4_IMPORT_ERROR!r}"
+        )
+
+
+HTML_SESSION = requests.Session()
+HTML_SESSION.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+})
+
+
+def fetch_page_html(url):
+    if not url:
+        return ''
+    try:
+        r = HTML_SESSION.get(url, timeout=12)
+    except Exception:
+        return ''
+    if r.status_code != 200 or not r.text:
+        return ''
+    return r.text
+
+
+def extract_structured_fields_from_html(html_text):
+    """
+    Returns a dict with optional keys:
+      - 'origin_text'
+      - 'roast_text'
+      - 'quantity_texts' (list)
+      - 'grind_text'
+    Only returns non-empty data if at least one known label was found.
+    """
+    if not html_text:
+        return {}
+
+    _require_bs4()
+
+    # Parse with lxml if available; fallback to built-in parser otherwise.
+    try:
+        soup = BeautifulSoup(html_text, 'lxml')
+    except Exception:
+        soup = BeautifulSoup(html_text, 'html.parser')
+
+    pairs = []
+
+    # 1) Tables: <tr><th>Label</th><td>Value</td></tr> (or <td>/<td>)
+    for tr in soup.find_all('tr'):
+        th = tr.find('th')
+        tds = tr.find_all('td')
+        if th and tds:
+            label = th.get_text(' ', strip=True)
+            value = tds[0].get_text(' ', strip=True)
+            if label and value:
+                pairs.append((label, value))
+            continue
+        # Fallback: two <td>s (label/value)
+        if len(tds) >= 2:
+            label = tds[0].get_text(' ', strip=True)
+            value = tds[1].get_text(' ', strip=True)
+            if label and value:
+                pairs.append((label, value))
+
+    # 2) Definition lists: <dt>Label</dt><dd>Value</dd>
+    for dt in soup.find_all('dt'):
+        dd = dt.find_next_sibling('dd')
+        if not dd:
+            continue
+        label = dt.get_text(' ', strip=True)
+        value = dd.get_text(' ', strip=True)
+        if label and value:
+            pairs.append((label, value))
+
+    # Build normalized label → list of values
+    norm = {}
+    for raw_label, raw_value in pairs:
+        nl = _normalize_label(raw_label)
+        if not nl:
+            continue
+        norm.setdefault(nl, []).append(raw_value)
+
+    # Identify if the page contains at least one known label
+    canonical_hits = []
+    for nl in norm.keys():
+        if nl in KNOWN_LABEL_SYNONYMS:
+            canonical_hits.append(KNOWN_LABEL_SYNONYMS[nl])
+    if not canonical_hits:
+        return {}
+
+    out = {}
+
+    # Pick first matching origin-like label
+    for key in ('origin', 'country', 'region', 'location', 'source'):
+        vals = norm.get(key)
+        if vals:
+            out['origin_text'] = vals[0]
+            break
+
+    # Pick first matching roast-like label
+    for key in ('roast degree', 'roast level', 'roast'):
+        vals = norm.get(key)
+        if vals:
+            out['roast_text'] = vals[0]
+            break
+
+    # Quantity-like labels (may appear as a list of options or a single value)
+    qty_vals = []
+    for key in ('labeled weight', 'bag size', 'weight', 'size'):
+        vals = norm.get(key) or []
+        qty_vals.extend(vals)
+    if qty_vals:
+        out['quantity_texts'] = qty_vals
+
+    # Grind/type-like label (Grind, Bean type, etc. — see KNOWN_LABEL_SYNONYMS)
+    for nl, vals in norm.items():
+        if KNOWN_LABEL_SYNONYMS.get(nl) == 'grind' and vals:
+            out['grind_text'] = vals[0]
+            break
+
+    return out
+
+# ==========================================
+# 2. SHARED LISTS (origins, quantities)
+# ==========================================
+ORIGINS_LIST = [
+    'Ethiopia', 'Kenya', 'Rwanda', 'Burundi', 'Uganda', 'Tanzania', 'Colombia',
+    'Brazil', 'Peru', 'Bolivia', 'Ecuador', 'Guatemala', 'Honduras', 'El Salvador',
+    'Nicaragua', 'Costa Rica', 'Panama', 'Mexico', 'Dominican Republic', 'Yemen',
+    'India', 'Indonesia', 'Papua New Guinea', 'Vietnam', 'Thailand', 'China',
+    'Timor-Leste', 'Malawi', 'Zambia', 'Cameroon', 'Philippines', 'Laos',
+    'Karnataka', 'Andhra Pradesh', 'Chickmaglur', 'Global', 'Myanmar', 'Sumatra',
+]
+
+QUANTITY_OPTIONS = [
+    '250g', '500g', '12oz', '2 lb', '5 lb', '2oz', '10oz',
+    '8 oz', '100g', '1.5 lb', '1000g', '4 oz', '2.5 lb', '16 oz',
+    '4.5 oz',  # e.g. Cutbow Colombia Gesha 4.5oz
+]
+
+# ==========================================
+# 3. ROASTER CONFIG FROM AIRTABLE
+# ==========================================
+def get_roasters_from_airtable():
+    """Read roaster name and base URL from the roasters config table.
+    Only include rows where Web Scrapping == 'Yes'.
+    Returns a list of dicts: [{"id": "...", "name": "...", "base_url": "..."}]
+    """
+    roasters = []
+    for rec in roasters_table.all():
+        fields = rec.get('fields', {})
+        name = fields.get(ROASTER_NAME_FIELD) or fields.get('Name')
+        url = fields.get(BASE_URL_FIELD) or fields.get('Store URL')
+        web_scrap_val = fields.get(WEB_SCRAPING_FIELD)
+        # Support single select / text where the label is 'Yes'
+        if isinstance(web_scrap_val, dict):
+            web_scrap_label = (web_scrap_val.get('name') or '').strip()
+        else:
+            web_scrap_label = str(web_scrap_val or '').strip()
+
+        platform_val = fields.get(PLATFORM_USED_FIELD)
+        # Support single select / text where the label is 'Shopify' or 'Woocommerce'
+        if isinstance(platform_val, dict):
+            platform_label = (platform_val.get('name') or '').strip()
+        else:
+            platform_label = str(platform_val or '').strip()
+
+        normalized_url = _normalize_store_base_url(url)
+        if name and normalized_url and web_scrap_label.lower() == 'yes':
+            roasters.append({
+                'id': rec.get('id'),
+                'name': str(name).strip(),
+                'base_url': normalized_url,
+                'platform_used': platform_label,
+            })
+    return roasters
+
+
+# ==========================================
+# 4. VENDOR → ROASTER (CLOSE MATCH)
+# ==========================================
+def _normalize_for_match(s):
+    """Lowercase, strip, remove common company suffixes for comparison."""
+    if not s:
+        return ''
+    s = s.lower().strip()
+    for suffix in [' co.', ' co', ' llc', ' inc.', ' inc', ' company', ' co']:
+        if s.endswith(suffix):
+            s = s[:-len(suffix)].strip()
+    return s
+
+
+def vendor_matches_roaster(shopify_vendor, roaster_display_name):
+    """True if Shopify vendor is a close match to the roaster name from Airtable."""
+    if not shopify_vendor or not roaster_display_name:
+        return False
+    v = _normalize_for_match(shopify_vendor)
+    r = _normalize_for_match(roaster_display_name)
+    if not v or not r:
+        return False
+    return r in v or v in r or v == r
+
+
+def get_roaster_display(shopify_vendor, roaster_display_name):
+    """If vendor is a close match to roaster name, return roaster name; else cleaned vendor."""
+    if not shopify_vendor:
+        return roaster_display_name or 'Unknown Roaster'
+    if vendor_matches_roaster(shopify_vendor, roaster_display_name):
+        return roaster_display_name
+    # Fallback: strip common suffixes from vendor
+    cleaned = shopify_vendor.strip()
+    for suffix in [' Co.', ' LLC', ' Inc.', ' Company']:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[:-len(suffix)].strip()
+            break
+    return cleaned or roaster_display_name
+
+
+def roaster_display_matches(airtable_roaster_value, current_roaster_name):
+    """True if the Roaster value stored in Airtable matches this run's roaster (for safe delete)."""
+    if not current_roaster_name:
+        return False
+    text = ''
+    if isinstance(airtable_roaster_value, list):
+        text = ' '.join(str(v) for v in airtable_roaster_value)
+    elif airtable_roaster_value is not None:
+        text = str(airtable_roaster_value)
+    return vendor_matches_roaster(text, current_roaster_name)
+
+
+# ==========================================
+# 5. TRANSLATOR FUNCTIONS
+# ==========================================
+def get_roast_level(text):
+    text = text.lower()
+    if 'medium light' in text or 'light medium' in text or 'blonde' in text:
+        return 'Medium Light'
+    if 'medium dark' in text or 'dark medium' in text or 'espresso roast' in text:
+        return 'Medium Dark'
+    if 'light' in text or 'filter roast' in text:
+        return 'Light'
+    if 'dark' in text or 'french' in text:
+        return 'Dark'
+    if 'medium' in text:
+        return 'Medium'
+    return None
+
+
+def get_origins(text):
+    text = text.lower()
+    # Never treat "Global" as a real origin keyword signal.
+    # "Global" is returned only when no other origin keywords are found.
+    found = [o for o in ORIGINS_LIST if o.lower() in text and o.lower() != 'global']
+    return found if found else ['Global']
+
+
+def _extract_weight_phrases_from_text(text):
+    """Return substrings like '12 oz', '4.5oz', '2 lb' for get_quantities()."""
+    if not text:
+        return []
+    out = []
+    for m in re.finditer(
+        r'\d+(?:\.\d+)?\s*(?:lb|lbs|pound|pounds|oz|ounce|ounces|g|gram|grams)\b',
+        str(text),
+        re.I,
+    ):
+        out.append(m.group(0))
+    return out
+
+
+def _strip_wordpress_seo_title_suffix(title, roaster_display_name=None):
+    """
+    Remove trailing site / SEO suffixes often added by WordPress themes or Yoast, e.g.
+    'Product Name - Cutbow Coffee' or 'Product Name | Site Name'.
+    """
+    if not title:
+        return title
+    t = re.sub(r'\s+', ' ', str(title).strip())
+    # Strip using known roaster display name from Airtable
+    if roaster_display_name:
+        rn = roaster_display_name.strip()
+        if rn:
+            pat = re.compile(
+                r'\s*(?:\s*[-|–—]\s*|\s*\|\s*)' + re.escape(rn) + r'\s*$',
+                re.I,
+            )
+            t = pat.sub('', t).strip()
+    return t
+
+
+def get_quantities(shopify_values):
+    """
+    Normalize free-form size strings (e.g. '2 lbs', '16 ounces', '250 grams')
+    into the canonical forms defined in QUANTITY_OPTIONS (e.g. '2 lb', '16 oz', '250g').
+    Applied generically across all platforms.
+    """
+    import re
+
+    def _normalize_quantity_string(s):
+        if not s:
+            return None
+        v = str(s).lower()
+        # Find "<number><optional space><unit>"
+        m = re.search(r'(\d+(?:\.\d+)?)\s*(lb|lbs|pound|pounds|oz|ounce|ounces|g|gram|grams)', v)
+        if not m:
+            return None
+        num, unit = m.groups()
+        # Canonicalize unit
+        if unit in ('lb', 'lbs', 'pound', 'pounds'):
+            base_unit = 'lb'
+        elif unit in ('oz', 'ounce', 'ounces'):
+            base_unit = 'oz'
+        else:  # grams
+            base_unit = 'g'
+        # Use a compact normalized key like "2lb", "16oz", "250g"
+        return f'{num}{base_unit}'
+
+    # Precompute normalized forms for all allowed quantity options
+    option_by_norm = {}
+    for q in QUANTITY_OPTIONS:
+        norm_q = _normalize_quantity_string(q)
+        if norm_q:
+            option_by_norm[norm_q] = q
+
+    found = set()
+    for val in shopify_values:
+        norm = _normalize_quantity_string(val)
+        if norm and norm in option_by_norm:
+            found.add(option_by_norm[norm])
+
+    return list(found)
+
+
+def get_types(shopify_values):
+    found = []
+    text = ' '.join(shopify_values or []).lower()
+    if 'whole' in text or 'bean' in text:
+        found.append('Whole Bean')
+    if 'ground' in text or 'drip' in text or 'espresso' in text:
+        found.append('Ground')
+    return list(set(found))
+
+
+def option_name_is_grind_or_bean_type(name):
+    """
+    True if a Shopify option name or WooCommerce attribute name indicates grind / preparation.
+
+    Matches e.g. 'Grind', 'Coffee grind', 'BEAN TYPE', 'Bean type', 'bean-type'.
+    Used so we still collect Whole Bean / Ground when the store never uses the word 'grind'.
+    """
+    if not name:
+        return False
+    n = str(name).lower()
+    if 'grind' in n:
+        return True
+    if 'bean' in n and 'type' in n:
+        return True
+    return False
+
+
+# ==========================================
+# 6. PLATFORM DETECTION
+# ==========================================
+def detect_platform(store_url):
+    """
+    Best-effort detection of whether a store is Shopify, WooCommerce, or Squarespace.
+    Returns: 'shopify', 'woocommerce', 'squarespace', or 'unknown'.
+    """
+    base = store_url.rstrip('/')
+    try:
+        resp = requests.get(base, timeout=10)
+    except Exception:
+        return 'unknown'
+
+    text = (resp.text or '').lower()
+    headers_low = {k.lower(): str(v).lower() for k, v in resp.headers.items()}
+
+    # Shopify indicators
+    if 'cdn.shopify.com' in text or 'shopify.theme' in text:
+        return 'shopify'
+    if 'x-shopify-stage' in headers_low or 'x-shopify-shop-domain' in headers_low:
+        return 'shopify'
+
+    # WooCommerce indicators in HTML
+    if 'wp-content/plugins/woocommerce' in text or 'woocommerce' in text and 'wp-content' in text:
+        return 'woocommerce'
+    if '/wp-json/wc/' in text:
+        return 'woocommerce'
+
+    # WooCommerce Store API probe
+    try:
+        api_resp = requests.get(f'{base}/wp-json/wc/store/v1/products', params={'per_page': 1}, timeout=5)
+        if api_resp.status_code == 200:
+            return 'woocommerce'
+    except Exception:
+        pass
+
+    # Shopify sitemap probe
+    try:
+        sm_resp = requests.get(f'{base}/sitemap.xml', timeout=5)
+        if sm_resp.status_code == 200 and 'sitemap_products' in sm_resp.text:
+            return 'shopify'
+    except Exception:
+        pass
+
+    # Squarespace indicators in HTML/headers/sitemap
+    if 'static1.squarespace.com' in text or 'squarespace.com' in text:
+        return 'squarespace'
+    if 'x-sqsp-edge' in headers_low or 'x-squarespace-request-id' in headers_low:
+        return 'squarespace'
+    if 'meta name="generator"' in text and 'squarespace' in text:
+        return 'squarespace'
+    try:
+        sm_resp = requests.get(f'{base}/sitemap.xml', timeout=5)
+        sm_txt = (sm_resp.text or '').lower()
+        if sm_resp.status_code == 200 and ('/shop/p/' in sm_txt or 'squarespace.com' in sm_txt):
+            return 'squarespace'
+    except Exception:
+        pass
+
+    return 'unknown'
+
+
+def is_wordpress_site(store_url):
+    """
+    Lightweight check for WordPress, independent of Shopify/Woo detection.
+    Used to optionally also run WordPress-style scrapers when appropriate.
+    """
+    base = store_url.rstrip('/')
+
+    # 1) Home page HTML/header indicators
+    try:
+        resp = requests.get(base, timeout=10, allow_redirects=True)
+        text = (resp.text or '').lower()
+        headers_low = {k.lower(): str(v).lower() for k, v in resp.headers.items()}
+    except Exception:
+        text = ''
+        headers_low = {}
+
+    if 'wp-content/' in text or 'wp-includes/' in text:
+        return True
+    if 'meta name="generator"' in text and 'wordpress' in text:
+        return True
+    if 'rel="https://api.w.org/' in text or 'api.w.org' in text:
+        return True
+    if 'x-pingback' in headers_low and 'xmlrpc.php' in headers_low.get('x-pingback', ''):
+        return True
+
+    # 2) Endpoint probes (more robust for sites hiding WP markers on homepage)
+    probes = [
+        ('/wp-json/', lambda r: r.status_code == 200 and ('name' in (r.text or '').lower() or 'routes' in (r.text or '').lower())),
+        ('/wp-login.php', lambda r: r.status_code in (200, 403) and 'wp-login' in (r.text or '').lower()),
+        ('/xmlrpc.php', lambda r: r.status_code in (200, 405, 403) and ('xml-rpc' in (r.text or '').lower() or 'xmlrpc' in (r.text or '').lower())),
+        ('/wp-content/', lambda r: r.status_code in (200, 301, 302, 403)),
+        ('/wp-includes/', lambda r: r.status_code in (200, 301, 302, 403)),
+    ]
+    hits = 0
+    for path, is_hit in probes:
+        try:
+            r = requests.get(f'{base}{path}', timeout=6, allow_redirects=True)
+            if is_hit(r):
+                hits += 1
+        except Exception:
+            continue
+
+    # Require at least one positive probe; stronger confidence if 2+.
+    return hits >= 1
+
+
+# ==========================================
+# 7. SITEMAP + PRODUCT DISCOVERY (SHOPIFY)
+# ==========================================
+def _loc_urls_from_sitemap_xml(xml_text):
+    urls = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return urls
+    for elem in root.iter():
+        tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+        if tag == 'loc' and elem.text:
+            urls.append(elem.text.strip())
+    return urls
+
+
+def _handle_from_product_url(url):
+    if '/products/' not in url:
+        return None
+    part = url.split('/products/')[-1]
+    handle = part.split('/')[0].split('?')[0].strip()
+    handle = _sanitize_url_for_parsing(handle)
+    return handle if handle else None
+
+
+def get_all_product_handles_from_sitemap(store_url):
+    base = store_url.rstrip('/')
+    resp = requests.get(f'{base}/sitemap.xml')
+    if resp.status_code != 200:
+        return []
+    product_sitemap_urls = [loc for loc in _loc_urls_from_sitemap_xml(resp.text) if 'sitemap_products' in loc]
+    handles = set()
+    for sm_url in product_sitemap_urls:
+        r = requests.get(sm_url)
+        if r.status_code != 200:
+            continue
+        for loc in _loc_urls_from_sitemap_xml(r.text):
+            h = _handle_from_product_url(loc)
+            if h:
+                handles.add(h)
+    return list(handles)
+
+
+def _shopify_breadcrumb_text(html_text):
+    """
+    Extract breadcrumb-ish text from Shopify pages so we can infer the product's
+    collection/category (e.g. "Home / Collections / SUBSCRIPTIONS / ...").
+    """
+    if not html_text:
+        return ''
+    _require_bs4()
+    try:
+        soup = BeautifulSoup(html_text, 'lxml')
+    except Exception:
+        soup = BeautifulSoup(html_text, 'html.parser')
+
+    # Try common breadcrumb containers first (avoid picking up header nav).
+    cand = []
+    for sel in (
+        'nav[aria-label*="breadcrumb"]',
+        '[class*="breadcrumb"]',
+        '[aria-label*="breadcrumb"]',
+    ):
+        for el in soup.select(sel):
+            t = el.get_text(' ', strip=True)
+            if t:
+                cand.append(t)
+    if cand:
+        # Prefer the longest match; it often contains "Home / Collections / ..."
+        return max(cand, key=len)
+
+    # Fallback: use full page text but later we match against "collections ... subscriptions/sample".
+    return soup.get_text(' ', strip=True)[:20000]
+
+
+def shopify_product_in_excluded_collection(html_text):
+    """
+    Return True if the product page UI indicates it's under excluded collections:
+      - Subscriptions
+      - Samples (including "Sample Sizes", "Samples", etc.)
+
+    When breadcrumb says a generic "All"/coffee collection, we don't exclude here;
+    title-based exclusions remain the source of truth.
+    """
+    if not html_text:
+        return False
+
+    _require_bs4()
+    try:
+        soup = BeautifulSoup(html_text, 'lxml')
+    except Exception:
+        soup = BeautifulSoup(html_text, 'html.parser')
+
+    bc = ''
+    # Prefer breadcrumb containers when present; else fall back to a small slice of page text.
+    try:
+        bc = (_shopify_breadcrumb_text(html_text) or '').lower()
+    except Exception:
+        bc = soup.get_text(' ', strip=True)[:20000].lower()
+
+    # 1) Breadcrumb-based exclusion (when Shopify includes collection context in breadcrumbs)
+    if re.search(r'collections[^a-z0-9]{0,25}subscriptions', bc):
+        return True
+    if re.search(r'collections[^a-z0-9]{0,25}samples?', bc):
+        return True
+
+    # 2) Subscription widget exclusion:
+    # Recharge subscription products often show "Delivery every ..." on the page UI.
+    lower = (html_text or '').lower()
+    if 'delivery every' in lower and ('recharge subscription' in lower or 'recharge subscriptions' in lower):
+        return True
+
+    # 3) Sample/taster exclusion:
+    # Shopify nav menus often contain "Samples" even for regular products, so we must rely on
+    # product meta / title markers (e.g., og:description contains "sample size",
+    # and the HTML <title> contains "... Sample: ...").
+    ogd = soup.find('meta', property='og:description')
+    og_description = ogd.get('content', '') if ogd else ''
+    name_desc = soup.find('meta', attrs={'name': 'description'})
+    name_description = name_desc.get('content', '') if name_desc else ''
+    title_tag = ''
+    t = soup.find('title')
+    if t:
+        title_tag = t.get_text(' ', strip=True)
+
+    sample_blob = f'{og_description} {name_description} {title_tag}'.lower()
+    if (
+        'sample size' in sample_blob
+        or 'sample:' in sample_blob
+        or 'stone dry sample' in sample_blob
+        or 'taster' in sample_blob
+    ):
+        return True
+
+    return False
+
+
+def shopify_product_is_subscription_only(product, html_text=''):
+    """
+    Conservative subscription-only detector for Shopify products.
+
+    Important behavior:
+    - We exclude only when product-specific signals are strong.
+    - "Subscribe & save" on normal coffee products should not be excluded unless the
+      SKU itself is clearly a subscription listing.
+    """
+    if not isinstance(product, dict):
+        return False
+
+    title = str(product.get('title') or '').strip().lower()
+    handle = str(product.get('handle') or '').strip().lower()
+    ptype = _normalize_product_type(product.get('product_type'))
+
+    # 1) Product-level Shopify metadata signal (when available on some stores).
+    selling_plan_groups = product.get('selling_plan_groups')
+    if isinstance(selling_plan_groups, list) and selling_plan_groups:
+        variants = product.get('variants') or []
+        # If every variant requires a selling plan, this is subscription-only.
+        # Mixed one-time + subscription products should not be excluded here.
+        requires_flags = [
+            bool(v.get('requires_selling_plan'))
+            for v in variants
+            if isinstance(v, dict) and v.get('requires_selling_plan') is not None
+        ]
+        if requires_flags and all(requires_flags):
+            return True
+
+    # 2) Strong handle/title/product_type signals for dedicated subscription SKUs.
+    strong_subscription_keywords = [
+        'subscription',
+        'subscribe',
+        'recurring',
+        'auto-ship',
+        'autoship',
+        'roasters-choice',
+    ]
+    if any(_keyword_as_word_in_text(handle, kw) for kw in strong_subscription_keywords):
+        return True
+    if any(_keyword_as_word_in_text(title, kw) for kw in strong_subscription_keywords):
+        return True
+    if _keyword_as_word_in_text(ptype, 'subscription'):
+        return True
+
+    # 3) Product-page buy-widget signal (only when one-time purchase is not present).
+    # This keeps mixed purchase-mode products from being excluded.
+    lower = str(html_text or '').lower()
+    if lower:
+        has_subscription_widget = (
+            ('delivery every' in lower)
+            and (
+                'recharge subscription' in lower
+                or 'recharge subscriptions' in lower
+                or 'name="selling_plan"' in lower
+                or "name='selling_plan'" in lower
+            )
+        )
+        has_one_time_marker = (
+            'one time' in lower
+            or
+            'one-time purchase' in lower
+            or 'one time purchase' in lower
+            or 'purchase options' in lower
+        )
+        if has_subscription_widget and not has_one_time_marker:
+            return True
+
+    return False
+
+
+def shopify_product_passes_empty_type_fallback(product):
+    """
+    SECOND CHANCE when Shopify's product_type is blank or doesn't say coffee/blend/origin.
+
+    Why this exists
+    ---------------
+    Some stores leave product_type empty on real coffee SKUs. The old rule was: skip anything
+    without product_type keywords — so products like "Burundi" or "Guatemala" never made it in.
+
+    What we do instead (same *idea* as WooCommerce's woo_product_passes_filters)
+    -----------------------------------------------------------------------------
+    We do NOT re-check EXCLUSION_TITLE_KEYWORDS here; the main loop still applies those right
+    after this gate (so "Coffee Mug" still drops via the title list).
+
+    1) Tags ≈ Woo "categories" for merch: if tags look like gift cards / gear / apparel,
+       we reject (EXCLUSION_CATEGORY_KEYWORDS).
+
+    2) Otherwise we KEEP the product only if we can find strong coffee signals:
+       - Bean/grind-type options on the Shopify product (e.g. option named "Grind" or
+         "Bean type" with values like "Whole Bean" / "Ground")
+       - OR: tags contain PRODUCT_TYPE_KEYWORDS (e.g. "coffee", "blend", "origin")
+       - OR: Any country/region from ORIGINS_LIST appears in the product text
+
+       We intentionally do *not* keep items just because their description mentions
+       the word "coffee" (many accessories and gifts include that word).
+
+    Examples
+    --------
+    - product_type "", title "Burundi Natural" → ORIGINS_LIST match → KEEP (then title filter).
+    - product_type "", tags "Gift Cards" → category exclusion → SKIP.
+    - product_type "", title "Random Candle", no signals → SKIP.
+    """
+    title = _html_stdlib.unescape(product.get('title') or '').strip()
+    body = _html_stdlib.unescape(product.get('body_html') or '')
+    vendor = (product.get('vendor') or '').strip()
+    tags_raw = product.get('tags')
+    if isinstance(tags_raw, list):
+        tags_str = ', '.join(str(t) for t in tags_raw)
+    else:
+        tags_str = str(tags_raw or '')
+    tags_lower = tags_str.lower()
+
+    search_all = (title + ' ' + body + ' ' + tags_str + ' ' + vendor).lower()
+    title_lower = title.lower()
+    body_lower = body.lower()
+
+    # Merch / gift-card exclusion (same intent as Woo category exclusions).
+    # We check broader than just tags because some Shopify products label these
+    # keywords in the title/description, not the "tags" field.
+    if any(_keyword_as_word_in_text(search_all, kw) for kw in EXCLUSION_CATEGORY_KEYWORDS):
+        return False
+
+    # Option A (safe tweak): if the title looks like a coffee SKU (Blend/Espresso),
+    # require a real "coffee" word somewhere in the visible text.
+    # This is specifically to recover stores that use empty product_type and/or
+    # non-standard tag vocab (e.g. Elixir "Weekender Blend", "Treehouse Blend").
+    if (
+        any(_keyword_as_word_in_text(title_lower, kw) for kw in ['blend', 'espresso'])
+        and _keyword_as_word_in_text(title_lower + ' ' + body_lower, 'coffee')
+    ):
+        return True
+
+    # 1) Strongest signal: explicit bean/grind option exists on the product.
+    for opt in product.get('options') or []:
+        opt_name = (opt.get('name') or '').lower()
+        if option_name_is_grind_or_bean_type(opt_name):
+            opt_values = opt.get('values') or []
+            if get_types(opt_values):
+                return True
+
+    # 2) Explicit tag-based signals.
+    if any(_keyword_as_word_in_text(tags_lower, kw) for kw in PRODUCT_TYPE_KEYWORDS):
+        return True
+
+    # 3) Origin signals inside the product text.
+    # Exclude "Global" so random CSS/JS text containing "global" doesn't trigger inclusion.
+    if any(o.lower() in search_all for o in ORIGINS_LIST if o.lower() != 'global'):
+        return True
+
+    return False
+
+
+def shopify_product_passes_wholesale_tag_rules(product):
+    """
+    Shopify tag gate requested by user:
+    - If tags are exactly {'coffee', 'wholesale'} -> exclude
+    - If tags are exactly {'coffee', 'intinew', 'wholesale'} -> exclude
+    - If tags are exactly {'wholesale'} -> exclude
+    - If tag 'grocery' is present (alone or with any other tags) -> exclude
+    - If there is exactly one tag and it is a 4-digit year (e.g. 2022) -> exclude
+    - If tags are empty -> include
+    - If tags include {'coffee', 'wholesale'} plus any extra tag(s) -> include
+    - Any other tag combination -> include
+    """
+    tags_raw = product.get('tags')
+    if isinstance(tags_raw, list):
+        raw_items = [str(t).strip().lower() for t in tags_raw if str(t).strip()]
+    else:
+        tags_text = str(tags_raw or '')
+        raw_items = [t.strip().lower() for t in tags_text.split(',') if t.strip()]
+
+    tags_set = set(raw_items)
+    if not tags_set:
+        return True
+
+    if 'grocery' in tags_set:
+        return False
+
+    if tags_set == {'wholesale'}:
+        return False
+
+    if tags_set == {'coffee', 'wholesale'}:
+        return False
+
+    if tags_set == {'coffee', 'intinew', 'wholesale'}:
+        return False
+
+    if len(tags_set) == 1:
+        only_tag = next(iter(tags_set))
+        if re.fullmatch(r'(19|20)\d{2}', only_tag):
+            return False
+
+    return True
+
+
+def get_shopify_collection_handles(store_url, collection_handle):
+    """
+    Return all product handles currently listed in a Shopify collection feed.
+
+    Why this exists:
+    - Some stores keep old products accessible via direct product URLs but hide them
+      from the storefront by removing them from active collections.
+    - Useful when you want to mirror what a storefront collection currently lists.
+
+    Returns
+    -------
+    set[str] | None
+        - set of handles on success (can be empty)
+        - None when the collection feed cannot be fetched/parsed, so caller can
+          safely fall back to existing scraper logic.
+    """
+    base = store_url.rstrip('/')
+    handle = str(collection_handle or '').strip().strip('/')
+    if not base or not handle:
+        return None
+
+    handles = set()
+    try:
+        for page in range(1, 21):
+            resp = requests.get(
+                f'{base}/collections/{handle}/products.json',
+                params={'limit': 250, 'page': page},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return None
+            payload = resp.json()
+            products = payload.get('products', []) if isinstance(payload, dict) else []
+            if not products:
+                break
+            for p in products:
+                h = str((p or {}).get('handle') or '').strip()
+                if h:
+                    handles.add(h)
+            if len(products) < 250:
+                break
+    except Exception:
+        return None
+
+    return handles
+
+
+def get_all_coffee_products_for_store(store_url, roaster_name=None, roaster_airtable_id=None):
+    """
+    Discover products via sitemap, fetch JSON, keep coffee-like products, then apply exclusions.
+
+    Parameters
+    ----------
+    roaster_name : str, optional
+        Reserved for logging / future use; roaster-specific rules use `roaster_airtable_id`.
+
+    roaster_airtable_id : str, optional
+        Roaster record id from Airtable (used when linking scraped products to roasters).
+
+    Filtering order (Shopify)
+    -------------------------
+    1) Exclude explicit Shopify product types:
+       - hawaiian coffee club
+       - espresso bites
+       - coffee & tea sets
+       - tea
+       - merch / merchandise
+       - tee / tees / t-shirt
+
+    2) product_type must contain coffee / blend / origin — OR if it doesn't, we run
+       shopify_product_passes_empty_type_fallback() (Woo-style signals from tags + text).
+
+    3) shopify_product_passes_wholesale_tag_rules() (global tag exclusions).
+
+    4) EXCLUSION_TITLE_KEYWORDS on the title (subscriptions, mugs, bundles, etc.).
+
+    5) shopify_product_is_subscription_only() on product metadata / page buy widget.
+
+    6) shopify_product_in_excluded_collection() on the live product page (subscriptions /
+       samples in breadcrumb or UI), but only for products kept via empty-type fallback.
+
+    See shopify_product_passes_empty_type_fallback.__doc__ for the fallback rules and examples.
+    """
+    handles = get_all_product_handles_from_sitemap(store_url)
+    coffee_products = []
+    for handle in handles:
+        url = f'{store_url}/products/{handle}.json'
+        resp = requests.get(url)
+        if resp.status_code != 200:
+            continue
+        product = resp.json().get('product', {})
+        if not product:
+            continue
+        ptype_normalized = _normalize_product_type(product.get('product_type'))
+        if ptype_normalized in EXCLUDED_SHOPIFY_PRODUCT_TYPES:
+            continue
+        ptype = (product.get('product_type') or '').lower()
+        ptype_ok = any(kw in ptype for kw in PRODUCT_TYPE_KEYWORDS)
+        kept_by_fallback = False
+        if not ptype_ok and not shopify_product_passes_empty_type_fallback(product):
+            continue
+        if not ptype_ok:
+            kept_by_fallback = True
+        if not shopify_product_passes_wholesale_tag_rules(product):
+            continue
+        title = (product.get('title') or '').lower()
+        if any(_keyword_as_word_in_text(title, kw) for kw in EXCLUSION_TITLE_KEYWORDS):
+            continue
+
+        product_page_url = f'{store_url}/products/{handle}'
+        html_text = fetch_page_html(product_page_url)
+        if shopify_product_is_subscription_only(product, html_text):
+            continue
+
+        # Option A: run collection/category UI heuristic only for products that were
+        # kept by empty-type fallback. Products that already pass explicit product_type
+        # checks skip this noisy UI gate to avoid false exclusions.
+        if kept_by_fallback and html_text and shopify_product_in_excluded_collection(html_text):
+            continue
+
+        coffee_products.append(product)
+    return coffee_products
+
+
+# ==========================================
+# 8. WOOCOMMERCE HELPERS (DISCOVERY + UPSERT)
+# ==========================================
+
+def get_roaster_ids_by_website():
+    """
+    Build a mapping from Roaster Information's Website field to its Airtable record ID.
+    This can be useful if you ever need URL → ID lookups; currently we pass IDs directly.
+    """
+    mapping = {}
+    try:
+        records = roasters_table.all(fields=[BASE_URL_FIELD])
+    except Exception:
+        return mapping
+
+    for rec in records:
+        fields = rec.get('fields', {})
+        website = (fields.get(BASE_URL_FIELD) or '').strip()
+        if not website:
+            continue
+        key = website.rstrip('/')
+        if key:
+            mapping[key] = rec.get('id')
+    return mapping
+
+
+# WooCommerce: use a session with browser-like headers so sitemaps and API return proper responses
+WOO_SESSION = requests.Session()
+WOO_SESSION.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/xml, application/json, text/html, */*',
+})
+
+
+def get_product_slugs_from_woo_sitemap(store_url):
+    """Get all product slugs from WooCommerce product sitemaps for a given store_url."""
+    base = store_url.rstrip('/')
+    index_urls = [f'{base}/sitemap.xml', f'{base}/sitemap_index.xml']
+    product_sitemap_urls = []
+
+    # 1) Look for product sitemap URLs inside the index files
+    for index_url in index_urls:
+        try:
+            resp = WOO_SESSION.get(index_url, timeout=10)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+        for loc in _loc_urls_from_sitemap_xml(resp.text):
+            if 'product-sitemap' in loc or 'product_sitemap' in loc:
+                product_sitemap_urls.append(loc)
+
+    # 2) Fallback: try common product sitemap paths if none were found in index
+    if not product_sitemap_urls:
+        for path in ['/product-sitemap1.xml', '/product-sitemap.xml']:
+            url = base + path
+            try:
+                r = WOO_SESSION.get(url, timeout=10)
+            except Exception:
+                continue
+            if r.status_code == 200 and ('/shop/' in r.text or '/product/' in r.text or 'shop' in r.text):
+                product_sitemap_urls.append(url)
+
+    if not product_sitemap_urls:
+        return []
+
+    slugs = set()
+
+    # 3) Visit each product sitemap URL and extract slugs
+    for product_sitemap_url in product_sitemap_urls:
+        try:
+            r = WOO_SESSION.get(product_sitemap_url, timeout=10)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        # Parse XML <loc> if present
+        for loc in _loc_urls_from_sitemap_xml(r.text):
+            for pattern in [r'/shop/([^/?]+)', r'/product/([^/?]+)']:
+                m = __import__('re').search(pattern, loc)
+                if m:
+                    slugs.add(m.group(1).rstrip('/'))
+                    break
+        # Also scan raw text (sitemap may be served as HTML by some hosts)
+        for m in __import__('re').finditer(r'/(?:shop|product)/([a-zA-Z0-9_.-]+)', r.text):
+            slug = m.group(1).rstrip('/')
+            if slug and slug != 'shop':
+                slugs.add(slug)
+
+    return list(slugs)
+
+
+def fetch_all_woo_products(store_url):
+    """Discover product slugs from WooCommerce sitemaps, then fetch each product by slug via Store API."""
+    base = store_url.rstrip('/')
+    api_url = f'{base}/wp-json/wc/store/v1/products'
+    slugs = get_product_slugs_from_woo_sitemap(store_url)
+    if not slugs:
+        # Fallback: try list endpoint (may return partial catalog)
+        all_products = []
+        for page in range(1, 20):
+            try:
+                resp = WOO_SESSION.get(api_url, params={'per_page': 50, 'page': page}, timeout=10)
+            except Exception:
+                break
+            if resp.status_code != 200:
+                break
+            try:
+                data = resp.json()
+            except Exception:
+                break
+            if not data:
+                break
+            all_products.extend(data)
+            if len(data) < 50:
+                break
+        return all_products
+
+    all_products = []
+    seen_ids = set()
+    for slug in slugs:
+        try:
+            resp = WOO_SESSION.get(api_url, params={'slug': slug}, timeout=10)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+        try:
+            data = resp.json()
+        except Exception:
+            continue
+        if not isinstance(data, list):
+            continue
+        for p in data:
+            pid = p.get('id')
+            if pid and pid not in seen_ids:
+                seen_ids.add(pid)
+                all_products.append(p)
+    return all_products
+
+
+def woo_product_passes_filters(p):
+    """Include only WooCommerce coffee products: exclude by title and by non-coffee categories."""
+    import html as _html
+    name = (p.get('name') or '')
+    name_clean = _html.unescape(name)
+    title_lower = name_clean.lower()
+    if any(_keyword_as_word_in_text(title_lower, kw) for kw in EXCLUSION_TITLE_KEYWORDS):
+        return False
+
+    categories = p.get('categories') or []
+    cat_text = ' '.join([c.get('name', '') + ' ' + c.get('slug', '') for c in categories]).lower()
+    desc = (p.get('description') or '') + ' ' + (p.get('short_description') or '')
+    search = (name_clean + ' ' + desc).lower()
+
+    # Exclude merch, equipment, gift cards, etc.
+    if any(_keyword_as_word_in_text(cat_text, kw) for kw in EXCLUSION_CATEGORY_KEYWORDS):
+        return False
+
+    # Include if clearly a coffee product: category or name/description/origin signals
+    if any(kw in cat_text for kw in PRODUCT_TYPE_KEYWORDS):
+        return True
+    # Exclude "Global" so CSS/JS "global" doesn't trigger inclusion.
+    if any(o.lower() in search for o in ORIGINS_LIST if o.lower() != 'global'):
+        return True
+    if 'coffee' in search or 'blend' in search:
+        return True
+    return False
+
+
+def _canonical_product_link(url):
+    """Strip query string and normalize so one product = one link (avoids duplicate rows per variant)."""
+    if not url:
+        return ''
+    url = _sanitize_url_for_parsing(url)
+    if not url:
+        return ''
+    return url.split('?')[0].rstrip('/') or url
+
+
+def merge_woo_primary_record(woo_rec, wp_rec):
+    """
+    WooCommerce is primary when both runs find the same product URL.
+    WordPress HTML fills missing or weak fields (e.g. Global origin, empty quantity).
+    """
+    if not wp_rec:
+        return dict(woo_rec) if woo_rec else {}
+    out = dict(woo_rec) if woo_rec else {}
+    if not out.get('Product Name') and wp_rec.get('Product Name'):
+        out['Product Name'] = wp_rec['Product Name']
+
+    wo = woo_rec.get('Origin') if woo_rec else None
+    wpo = wp_rec.get('Origin') or []
+    if not wo or wo == ['Global']:
+        if wpo and wpo != ['Global']:
+            out['Origin'] = wpo
+    else:
+        out['Origin'] = woo_rec['Origin']
+
+    if not (woo_rec or {}).get('Roast Level') and wp_rec.get('Roast Level'):
+        out['Roast Level'] = wp_rec['Roast Level']
+
+    if not (woo_rec or {}).get('Quantity') and wp_rec.get('Quantity'):
+        out['Quantity'] = wp_rec['Quantity']
+
+    wt = (woo_rec or {}).get('Type') or []
+    wpt = wp_rec.get('Type') or []
+    if wt == ['Whole Bean'] and wpt and wpt != ['Whole Bean']:
+        out['Type'] = wpt
+    elif not wt and wpt:
+        out['Type'] = wpt
+
+    if not (woo_rec or {}).get('Product Image') and wp_rec.get('Product Image'):
+        out['Product Image'] = wp_rec['Product Image']
+
+    return out
+
+
+def get_product_urls_from_wordpress_sitemaps(store_url):
+    """
+    Collect canonical product page URLs from WooCommerce/WP product sitemaps.
+    Uses full <loc> URLs so nested paths like /shop/.../single-origin/.../ work (e.g. Cutbow).
+    """
+    base = store_url.rstrip('/')
+    index_urls = [f'{base}/sitemap.xml', f'{base}/sitemap_index.xml']
+    product_sitemap_urls = []
+
+    for index_url in index_urls:
+        try:
+            resp = WOO_SESSION.get(index_url, timeout=10)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+        for loc in _loc_urls_from_sitemap_xml(resp.text):
+            if 'product-sitemap' in loc or 'product_sitemap' in loc:
+                product_sitemap_urls.append(loc)
+
+    if not product_sitemap_urls:
+        for path in ['/product-sitemap1.xml', '/product-sitemap.xml']:
+            url = base + path
+            try:
+                r = WOO_SESSION.get(url, timeout=10)
+            except Exception:
+                continue
+            if r.status_code == 200 and ('/shop/' in r.text or '/product/' in r.text):
+                product_sitemap_urls.append(url)
+
+    if not product_sitemap_urls:
+        return []
+
+    out = set()
+    skip_substrings = ('/cart', '/checkout', '/my-account', '/wishlist', '/sample-page')
+
+    for sm_url in product_sitemap_urls:
+        try:
+            r = WOO_SESSION.get(sm_url, timeout=10)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        for loc in _loc_urls_from_sitemap_xml(r.text):
+            loc = (loc or '').strip()
+            if not loc or not loc.startswith('http'):
+                continue
+            # Avoid urlparse ValueError from malformed sitemap URLs.
+            # (e.g. stray trailing delimiters like ']').
+            path = _safe_url_path_lower(loc)
+            if any(s in path for s in skip_substrings):
+                continue
+            if '/product-category/' in path:
+                continue
+            if path.endswith('/shop') or path.endswith('/shop/'):
+                continue
+            if '/shop/' in path or '/product/' in path:
+                out.add(_canonical_product_link(loc))
+
+    return list(out)
+
+
+def _wordpress_collect_category_text(soup):
+    """Category / tag text from typical WooCommerce markup (for exclusion filters)."""
+    parts = []
+    for sel in ('a[rel="tag"]', '.posted_in a', '.product_meta a', '.woocommerce-breadcrumb a'):
+        for elem in soup.select(sel):
+            t = elem.get_text(' ', strip=True)
+            if t:
+                parts.append(t)
+    return ' '.join(parts).lower()
+
+
+def wordpress_product_passes_html_filters(name, html_text, category_text):
+    """Same rules as Woo: title exclusions, category exclusions, coffee heuristics."""
+    if not name:
+        return False
+    title_lower = name.lower()
+    if any(_keyword_as_word_in_text(title_lower, kw) for kw in EXCLUSION_TITLE_KEYWORDS):
+        return False
+
+    cat_lower = (category_text or '').lower()
+    if any(_keyword_as_word_in_text(cat_lower, kw) for kw in EXCLUSION_CATEGORY_KEYWORDS):
+        return False
+
+    # Include signals: product type in categories, or coffee-like copy
+    search = (name + ' ' + (html_text or '')[:12000]).lower()
+    if any(kw in cat_lower for kw in PRODUCT_TYPE_KEYWORDS):
+        return True
+    # Exclude "Global" so CSS/JS "global" doesn't trigger inclusion.
+    if any(o.lower() in search for o in ORIGINS_LIST if o.lower() != 'global'):
+        return True
+    if 'coffee' in search or 'blend' in search or 'espresso' in search or 'single origin' in search:
+        return True
+    return False
+
+
+def _wordpress_collect_sizes_and_grinds(soup, name, desc):
+    """
+    Collect size and grind option strings from WooCommerce markup.
+    Cutbow (and similar) often put bag size only in the product title (e.g. '12oz') while the
+    <select> is for grind/brew method only — so we also scan title/description for weight phrases.
+    """
+    sizes_raw = []
+    grinds_raw = []
+
+    for sel in soup.find_all('select'):
+        label = ''
+        for prev in sel.find_previous_siblings(limit=8):
+            if prev.name == 'label':
+                label = prev.get_text(' ', strip=True).lower()
+                break
+        if not label:
+            lab = sel.find_parent('td')
+            if lab:
+                th = lab.find_previous('th')
+                if th:
+                    label = th.get_text(' ', strip=True).lower()
+
+        opts = []
+        for opt in sel.find_all('option'):
+            val = (opt.get('value') or opt.get_text() or '').strip()
+            if not val or val.lower() in ('choose an option', 'choose', ''):
+                continue
+            opts.append(val.replace('-', ' ').strip())
+
+        opt_blob = ' '.join(opts).lower()
+        lbl = label
+
+        # Size: explicit label or options that look like bag weights (12 oz, 2 lb, 250g)
+        if any(x in lbl for x in ('size', 'weight', 'bag', 'ounce', 'oz')):
+            sizes_raw.extend(opts)
+            continue
+        if re.search(r'\d', opt_blob) and re.search(r'\b(oz|lb|lbs|g|gram)\b', opt_blob):
+            sizes_raw.extend(opts)
+            continue
+
+        # Grind / preparation (Cutbow: "Whole Bean or Ground Coffee?" with brew methods).
+        # option_name_is_grind_or_bean_type covers "Grind" and "Bean type" (same as Woo Store API).
+        if (
+            option_name_is_grind_or_bean_type(lbl)
+            or any(x in lbl for x in ('ground', 'whole bean', 'brew', 'prepare'))
+        ) or (not re.search(r'\b(oz|lb)\b', opt_blob) and any(
+            x in opt_blob for x in ('whole bean', 'espresso', 'french press', 'turkish', 'drip', 'pour')
+        )):
+            grinds_raw.extend(opts)
+
+    # Table-based attribute rows (some themes use <table> for variations)
+    for tr in soup.find_all('tr'):
+        th = tr.find('th')
+        tds = tr.find_all('td')
+        if not th or not tds:
+            continue
+        lh = th.get_text(' ', strip=True).lower()
+        if not any(x in lh for x in ('size', 'weight', 'bag', 'ounce', 'oz')):
+            continue
+        cell = tds[0]
+        s_el = cell.find('select')
+        if s_el:
+            for opt in s_el.find_all('option'):
+                val = (opt.get('value') or opt.get_text() or '').strip()
+                if val and val.lower() not in ('choose an option', 'choose', ''):
+                    sizes_raw.append(val.replace('-', ' ').strip())
+
+    blob = f'{name} {desc}'
+    sizes_raw.extend(_extract_weight_phrases_from_text(blob))
+
+    return sizes_raw, grinds_raw
+
+
+def parse_wordpress_product_html(url, html_text, roaster_display_name, roaster_airtable_id=None):
+    """
+    Map a WordPress/WooCommerce product HTML page to the same Airtable record shape as Shopify/Woo JSON.
+    Returns None if the page does not look like a product.
+    """
+    if not html_text:
+        return None
+    _require_bs4()
+    try:
+        soup = BeautifulSoup(html_text, 'lxml')
+    except Exception:
+        soup = BeautifulSoup(html_text, 'html.parser')
+
+    body = soup.find('body')
+    body_classes = ' '.join(body.get('class') or []) if body else ''
+    if body and 'product' not in body_classes.lower() and not soup.find(class_=re.compile(r'product')):
+        # Not clearly a product template
+        if not soup.find('meta', attrs={'property': 'og:type', 'content': re.compile('product', re.I)}):
+            if not soup.find(class_=re.compile('woocommerce')):
+                return None
+
+    name = ''
+    og = soup.find('meta', property='og:title')
+    if og and og.get('content'):
+        name = _html_stdlib.unescape(og['content'].strip())
+    if not name:
+        h1 = soup.find('h1', class_=re.compile('product_title')) or soup.find('h1')
+        if h1:
+            name = _html_stdlib.unescape(h1.get_text(' ', strip=True))
+
+    name = _strip_wordpress_seo_title_suffix(name, roaster_display_name)
+
+    desc_chunks = []
+    short_el = soup.find('div', class_=re.compile('woocommerce-product-details__short-description'))
+    if short_el:
+        desc_chunks.append(short_el.get_text(' ', strip=True))
+    long_el = soup.select_one('div#tab-description, div.woocommerce-Tabs-panel--description')
+    if long_el:
+        desc_chunks.append(long_el.get_text(' ', strip=True))
+    desc = ' '.join(desc_chunks)
+
+    search_text = (name + ' ' + desc).lower()
+    tags_list = []
+    for t in soup.select('a[rel="tag"]'):
+        tags_list.append(t.get_text(' ', strip=True))
+
+    sizes_raw, grinds_raw = _wordpress_collect_sizes_and_grinds(soup, name, desc)
+
+    final_roast = get_roast_level(search_text)
+    final_origins = get_origins(search_text)
+    final_quantities = get_quantities(sizes_raw)
+    final_types = get_types(grinds_raw)
+    if not final_types:
+        final_types = ['Whole Bean']
+
+    extracted = extract_structured_fields_from_html(html_text)
+    if extracted:
+        if final_origins == ['Global'] and extracted.get('origin_text'):
+            o2 = get_origins(extracted['origin_text'])
+            if o2 and o2 != ['Global']:
+                final_origins = o2
+        if final_roast is None and extracted.get('roast_text'):
+            r2 = get_roast_level(extracted['roast_text'])
+            if r2:
+                final_roast = r2
+        if not final_quantities and extracted.get('quantity_texts'):
+            q2 = get_quantities(extracted.get('quantity_texts') or [])
+            if q2:
+                final_quantities = q2
+        if extracted.get('grind_text'):
+            t2 = get_types([extracted['grind_text']])
+            if t2:
+                final_types = sorted(list(set(final_types + t2)))
+
+    product_link = _canonical_product_link(url)
+    if roaster_airtable_id:
+        roaster_value = [roaster_airtable_id]
+    else:
+        roaster_value = [roaster_display_name]
+
+    record = {
+        'Product Name': name,
+        'Roaster': roaster_value,
+        'Product Link': product_link,
+        'Origin': final_origins,
+        'Quantity': final_quantities,
+        'Type': final_types,
+    }
+    if final_roast:
+        record['Roast Level'] = final_roast
+
+    og_img = soup.find('meta', property='og:image')
+    if og_img and og_img.get('content'):
+        src = og_img['content'].strip()
+        if src:
+            record['Product Image'] = [{'url': src}]
+
+    return record
+
+
+def get_product_urls_from_squarespace_sitemaps(store_url):
+    """
+    Collect probable Squarespace product detail URLs from sitemap(s).
+    Works for common Squarespace commerce paths like /shop/p/... and /products/...
+    """
+    base = store_url.rstrip('/')
+    index_urls = [f'{base}/sitemap.xml', f'{base}/sitemap_index.xml']
+    sitemap_urls = []
+
+    for index_url in index_urls:
+        try:
+            resp = requests.get(index_url, timeout=10)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+
+        locs = _loc_urls_from_sitemap_xml(resp.text)
+        if locs:
+            sitemap_urls.extend(locs)
+            continue
+
+        # Some hosts return non-XML text; fallback to raw URL scan.
+        for m in re.finditer(r'https?://[^\s<>"\']+', resp.text or ''):
+            sitemap_urls.append(m.group(0))
+
+    if not sitemap_urls:
+        sitemap_urls = [f'{base}/sitemap.xml']
+
+    out = set()
+    skip_substrings = (
+        '/cart', '/checkout', '/account', '/login', '/search',
+        '/subscribe', '/subscriptions', '/blog', '/about', '/contact',
+    )
+    product_hints = ('/shop/p/', '/products/', '/product/')
+
+    for sm_url in set(sitemap_urls):
+        if not str(sm_url).startswith('http'):
+            continue
+        try:
+            r = requests.get(sm_url, timeout=10)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+
+        locs = _loc_urls_from_sitemap_xml(r.text)
+        if not locs:
+            locs = [m.group(0) for m in re.finditer(r'https?://[^\s<>"\']+', r.text or '')]
+
+        for loc in locs:
+            loc = _sanitize_url_for_parsing(loc)
+            if not loc.startswith('http'):
+                continue
+            path = _safe_url_path_lower(loc)
+            if not path:
+                continue
+            if any(s in path for s in skip_substrings):
+                continue
+            if any(h in path for h in product_hints):
+                out.add(_canonical_product_link(loc))
+
+    return list(out)
+
+
+def _squarespace_collect_category_text(soup):
+    """
+    Best-effort category/tag text from Squarespace product pages.
+    """
+    parts = []
+    for sel in (
+        '.ProductItem-nav-breadcrumb a',
+        '.breadcrumb a',
+        '[data-test*="breadcrumb"] a',
+        'a[href*="/shop?category"]',
+        'a[href*="/category/"]',
+        'a[href*="/tag/"]',
+    ):
+        for elem in soup.select(sel):
+            t = elem.get_text(' ', strip=True)
+            if t:
+                parts.append(t)
+    return ' '.join(parts).lower()
+
+
+def squarespace_product_passes_filters(name, html_text, category_text=''):
+    """
+    Same policy intent as Shopify/Woo:
+    - reject title/category exclusions
+    - include on strong coffee signals (category/type keywords, origins, grind/bean options)
+    """
+    if not name:
+        return False
+    title_lower = (name or '').lower()
+    if any(_keyword_as_word_in_text(title_lower, kw) for kw in EXCLUSION_TITLE_KEYWORDS):
+        return False
+
+    cat_lower = (category_text or '').lower()
+    # For category exclusions, avoid full-page HTML (menus/footers can mention gift cards/merch).
+    exclusion_blob = (title_lower + ' ' + cat_lower)
+    if any(_keyword_as_word_in_text(exclusion_blob, kw) for kw in EXCLUSION_CATEGORY_KEYWORDS):
+        return False
+
+    # Build product-focused text only (name + product detail regions), not entire page chrome.
+    search_parts = [name or '']
+    _require_bs4()
+    try:
+        soup = BeautifulSoup(html_text or '', 'lxml')
+    except Exception:
+        soup = BeautifulSoup(html_text or '', 'html.parser')
+    for sel in (
+        'h1',
+        '.ProductItem-details-excerpt',
+        '.product-description',
+        '[data-test="product-description"]',
+        '.ProductItem-details',
+    ):
+        for el in soup.select(sel):
+            t = el.get_text(' ', strip=True)
+            if t:
+                search_parts.append(t)
+    search = ' '.join(search_parts).lower()
+
+    if any(kw in cat_lower for kw in PRODUCT_TYPE_KEYWORDS):
+        return True
+    # Exclude "Global" so CSS/JS "global" doesn't trigger inclusion.
+    if any(o.lower() in search for o in ORIGINS_LIST if o.lower() != 'global'):
+        return True
+
+    # Strong bean/grind signal from variants/options.
+    if re.search(r'\b(bean type|grind)\b', search):
+        if re.search(r'\b(whole bean|ground|drip|french press|espresso)\b', search):
+            return True
+
+    # Keep coffee-like pages with specific coffee terms.
+    if any(k in search for k in ('single origin', 'espresso blend', 'coffee blend', 'filter blend')):
+        return True
+    return False
+
+
+def _squarespace_collect_sizes_and_grinds(soup):
+    """
+    Collect size and grind options from common Squarespace selectors and option labels.
+    """
+    sizes_raw = []
+    grinds_raw = []
+
+    # 1) <select> based variants
+    for sel in soup.find_all('select'):
+        label = ''
+        sel_id = sel.get('id') or ''
+        if sel_id:
+            lab = soup.find('label', attrs={'for': sel_id})
+            if lab:
+                label = lab.get_text(' ', strip=True).lower()
+        if not label:
+            prev_label = sel.find_previous('label')
+            if prev_label:
+                label = prev_label.get_text(' ', strip=True).lower()
+
+        opts = []
+        for opt in sel.find_all('option'):
+            val = (opt.get('value') or opt.get_text() or '').strip()
+            if not val or val.lower() in ('select size', 'select grind', 'select', 'choose an option'):
+                continue
+            opts.append(val.replace('-', ' ').strip())
+
+        opt_blob = ' '.join(opts).lower()
+        if any(x in label for x in ('size', 'weight', 'bag', 'ounce', 'oz')):
+            sizes_raw.extend(opts)
+            continue
+        if re.search(r'\d', opt_blob) and re.search(r'\b(oz|lb|lbs|g|gram)\b', opt_blob):
+            sizes_raw.extend(opts)
+            continue
+        if option_name_is_grind_or_bean_type(label) or any(x in label for x in ('ground', 'whole bean')):
+            grinds_raw.extend(opts)
+            continue
+        if any(x in opt_blob for x in ('whole bean', 'ground', 'drip', 'french press', 'espresso')):
+            grinds_raw.extend(opts)
+
+    # 2) Generic text fallback from page content
+    text = soup.get_text(' ', strip=True).lower()
+    for m in re.finditer(r'\b\d+(?:\.\d+)?\s*(?:oz|ounce|ounces|lb|lbs|pound|pounds|g|gram|grams)\b', text):
+        sizes_raw.append(m.group(0))
+    if re.search(r'\bwhole bean\b', text):
+        grinds_raw.append('Whole Bean')
+    if re.search(r'\b(ground|drip|french press|espresso)\b', text):
+        grinds_raw.append('Ground')
+
+    return sizes_raw, grinds_raw
+
+
+def squarespace_product_to_record(url, html_text, roaster_display_name, roaster_airtable_id=None):
+    """
+    Parse a Squarespace product page into the shared Airtable record shape.
+    """
+    if not html_text:
+        return None
+    _require_bs4()
+    try:
+        soup = BeautifulSoup(html_text, 'lxml')
+    except Exception:
+        soup = BeautifulSoup(html_text, 'html.parser')
+
+    title = ''
+    og = soup.find('meta', property='og:title')
+    if og and og.get('content'):
+        title = _html_stdlib.unescape(og.get('content', '').strip())
+    if not title:
+        h1 = soup.find('h1')
+        if h1:
+            title = _html_stdlib.unescape(h1.get_text(' ', strip=True))
+    if not title:
+        return None
+    # Some Squarespace pages include "Product — Roaster Name" in og:title.
+    title = _strip_wordpress_seo_title_suffix(title, roaster_display_name)
+
+    desc = ''
+    md = soup.find('meta', attrs={'name': 'description'})
+    if md and md.get('content'):
+        desc = _html_stdlib.unescape(md.get('content', '').strip())
+    if not desc:
+        # Product description region fallback
+        for sel in (
+            '.ProductItem-details-excerpt',
+            '.product-description',
+            '[data-test="product-description"]',
+        ):
+            el = soup.select_one(sel)
+            if el:
+                desc = _html_stdlib.unescape(el.get_text(' ', strip=True))
+                break
+
+    sizes_raw, grinds_raw = _squarespace_collect_sizes_and_grinds(soup)
+    search_text = f'{title} {desc} {(html_text or "")[:25000]}'
+
+    final_origins = get_origins(search_text)
+    final_roast = get_roast_level(search_text)
+    final_quantities = get_quantities(sizes_raw)
+    final_types = get_types(grinds_raw)
+    if not final_types:
+        final_types = ['Whole Bean']
+
+    extracted = extract_structured_fields_from_html(html_text)
+    if extracted:
+        if final_origins == ['Global'] and extracted.get('origin_text'):
+            o2 = get_origins(extracted['origin_text'])
+            if o2 and o2 != ['Global']:
+                final_origins = o2
+        if final_roast is None and extracted.get('roast_text'):
+            r2 = get_roast_level(extracted['roast_text'])
+            if r2:
+                final_roast = r2
+        if not final_quantities and extracted.get('quantity_texts'):
+            q2 = get_quantities(extracted.get('quantity_texts') or [])
+            if q2:
+                final_quantities = q2
+        if extracted.get('grind_text'):
+            t2 = get_types([extracted['grind_text']])
+            if t2:
+                final_types = sorted(list(set(final_types + t2)))
+
+    if roaster_airtable_id:
+        roaster_value = [roaster_airtable_id]
+    else:
+        roaster_value = [roaster_display_name]
+
+    record = {
+        'Product Name': title,
+        'Roaster': roaster_value,
+        'Product Link': _canonical_product_link(url),
+        'Origin': final_origins,
+        'Quantity': final_quantities,
+        'Type': final_types,
+    }
+    if final_roast:
+        record['Roast Level'] = final_roast
+
+    og_img = soup.find('meta', property='og:image')
+    if og_img and og_img.get('content'):
+        src = og_img.get('content', '').strip()
+        if src:
+            record['Product Image'] = [{'url': src}]
+
+    return record
+
+
+def fetch_and_push_squarespace_for_roaster(roaster_name, store_url, roaster_airtable_id=None):
+    """
+    Generic Squarespace HTML product pass: discover product URLs, filter, parse, and upsert.
+    """
+    existing_by_link = {}
+    for rec in products_table.all(fields=['Product Link', 'Roaster']):
+        fields = rec.get('fields', {})
+        link = fields.get('Product Link')
+        if not link:
+            continue
+        canonical = _canonical_product_link(link)
+        roaster_val = fields.get('Roaster')
+        roaster_text = ''
+        roaster_ids = []
+        if isinstance(roaster_val, list):
+            roaster_ids = [str(v) for v in roaster_val]
+            roaster_text = ' '.join(roaster_ids)
+        elif roaster_val is not None:
+            roaster_text = str(roaster_val)
+        existing_by_link[canonical] = {
+            'id': rec['id'],
+            'roaster_text': roaster_text,
+            'roaster_ids': roaster_ids,
+        }
+
+    print(f'\n——— {roaster_name} ({store_url}) [Squarespace] ———')
+    print('Discovering product URLs from sitemaps...')
+    urls = get_product_urls_from_squarespace_sitemaps(store_url)
+    print(f'Found {len(urls)} product URL(s). Fetching & filtering...\n')
+
+    if REPLACE_ROASTER_PRODUCTS_EACH_RUN:
+        replace_existing_products_for_roaster(roaster_name, roaster_airtable_id, existing_by_link)
+
+    seen_links = set()
+    for page_url in urls:
+        html_text = fetch_page_html(page_url)
+        if not html_text:
+            continue
+        _require_bs4()
+        try:
+            soup = BeautifulSoup(html_text, 'lxml')
+        except Exception:
+            soup = BeautifulSoup(html_text, 'html.parser')
+
+        name = ''
+        og = soup.find('meta', property='og:title')
+        if og and og.get('content'):
+            name = _html_stdlib.unescape(og.get('content', '').strip())
+        if not name:
+            h1 = soup.find('h1')
+            if h1:
+                name = _html_stdlib.unescape(h1.get_text(' ', strip=True))
+
+        cat_text = _squarespace_collect_category_text(soup)
+        if not squarespace_product_passes_filters(name, html_text, cat_text):
+            continue
+
+        rec = squarespace_product_to_record(page_url, html_text, roaster_name, roaster_airtable_id)
+        if not rec or not rec.get('Product Link'):
+            continue
+
+        canonical = _canonical_product_link(rec['Product Link'])
+        seen_links.add(canonical)
+        entry = existing_by_link.get(canonical)
+        existing_id = entry['id'] if entry else None
+        try:
+            if DRY_RUN:
+                if existing_id:
+                    print(f'  [DRY_RUN] 🔁 Would update: {rec.get("Product Name")}')
+                else:
+                    print(f'  [DRY_RUN] ✅ Would add: {rec.get("Product Name")}')
+            else:
+                if existing_id:
+                    products_table.update(existing_id, rec, typecast=True)
+                    print(f'  🔁 Updated: {rec.get("Product Name")}')
+                else:
+                    created = products_table.create(rec, typecast=True)
+                    existing_by_link[canonical] = {
+                        'id': created['id'],
+                        'roaster_text': roaster_name,
+                        'roaster_ids': [str(roaster_airtable_id)] if roaster_airtable_id else [],
+                    }
+                    print(f'  ✅ Added: {rec.get("Product Name")}')
+        except Exception as e:
+            print(f'  ❌ Failed {rec.get("Product Name")}: {e}')
+
+    delete_obsolete_products_for_roaster(roaster_name, roaster_airtable_id, seen_links, existing_by_link)
+    print('\nDone with Squarespace roaster.')
+
+
+def delete_obsolete_products_for_roaster(roaster_name, roaster_airtable_id, seen_links, existing_by_link):
+    """
+    Remove product rows for this roaster whose Product Link is not in seen_links.
+    existing_by_link: canonical link -> {'id', 'roaster_text', 'roaster_ids'}
+    """
+    roaster_id = roaster_airtable_id
+
+    def is_this_roaster(meta):
+        if roaster_id and roaster_id in meta.get('roaster_ids', []):
+            return True
+        rt = (meta.get('roaster_text') or '').lower()
+        return roaster_name.lower() in rt
+
+    links_to_delete = [
+        link for link, meta in existing_by_link.items()
+        if is_this_roaster(meta) and link not in seen_links
+    ]
+    if not links_to_delete:
+        return
+    print(f'\n  Deleting {len(links_to_delete)} obsolete record(s) for {roaster_name}...')
+    if DRY_RUN:
+        print(f'  [DRY_RUN] Would delete {len(links_to_delete)} record(s), but DRY_RUN is enabled.')
+        return
+    ids_to_delete = [existing_by_link[link]['id'] for link in links_to_delete]
+    for i in range(0, len(ids_to_delete), 10):
+        batch = ids_to_delete[i : i + 10]
+        try:
+            products_table.batch_delete(batch)
+            print(f'  🗑️ Deleted {len(batch)} record(s).')
+        except Exception as e:
+            print(f'  ❌ Batch delete failed: {e}')
+
+
+def replace_existing_products_for_roaster(roaster_name, roaster_airtable_id, existing_by_link):
+    """
+    Delete all current Airtable rows for a roaster before re-adding fresh scrape results.
+    Returns the number of matched existing rows.
+    """
+    roaster_id = str(roaster_airtable_id or '').strip()
+    links_to_replace = []
+    for link, meta in existing_by_link.items():
+        ids = [str(v) for v in (meta.get('roaster_ids') or [])]
+        rt = str(meta.get('roaster_text') or meta.get('roaster_display') or '')
+        if (roaster_id and roaster_id in ids) or roaster_display_matches(rt, roaster_name):
+            links_to_replace.append(link)
+
+    if not links_to_replace:
+        return 0
+
+    print(f"  Replacing {len(links_to_replace)} existing record(s) for {roaster_name}...")
+    if DRY_RUN:
+        print(f'  [DRY_RUN] Would delete {len(links_to_replace)} existing record(s) before re-add.')
+    else:
+        ids_to_delete = [existing_by_link[link]['id'] for link in links_to_replace]
+        for i in range(0, len(ids_to_delete), 10):
+            batch = ids_to_delete[i : i + 10]
+            try:
+                products_table.batch_delete(batch)
+                print(f"  🗑️ Deleted {len(batch)} record(s) for replace mode.")
+            except Exception as e:
+                print(f"  ❌ Replace-mode batch delete failed: {e}")
+                for rid in batch:
+                    try:
+                        products_table.delete(rid)
+                        print("  🗑️ Deleted 1 record (replace fallback).")
+                    except Exception as e2:
+                        msg = str(e2)
+                        if 'NOT_FOUND' in msg or '404' in msg:
+                            print("  ℹ️ Skip missing record (replace fallback).")
+                        else:
+                            print(f"  ❌ Replace fallback delete failed: {e2}")
+    for link in links_to_replace:
+        existing_by_link.pop(link, None)
+    return len(links_to_replace)
+
+
+def fetch_and_push_wordpress_for_roaster(
+    roaster_name,
+    store_url,
+    roaster_airtable_id=None,
+    woo_seen_links=None,
+    woo_records_by_link=None,
+    defer_delete=False,
+):
+    """
+    Generic WordPress/WooCommerce *HTML* product pass: discover URLs from sitemaps, parse each page,
+    apply the same inclusion/exclusion rules as Shopify/Woo, upsert to Airtable.
+
+    When woo_seen_links / woo_records_by_link are provided (same roaster after WooCommerce run):
+    - WooCommerce is primary; WordPress only fills missing fields on overlapping URLs.
+    - WordPress can still discover extra product URLs the Store API missed.
+
+    Returns dict with:
+      - 'seen_links': set of canonical URLs to keep for this roaster
+      - 'existing_by_link': snapshot used for delete (if defer_delete)
+    """
+    woo_seen_links = woo_seen_links or set()
+    woo_records_by_link = woo_records_by_link or {}
+
+    existing_by_link = {}
+    for rec in products_table.all(fields=['Product Link', 'Roaster']):
+        fields = rec.get('fields', {})
+        link = fields.get('Product Link')
+        if not link:
+            continue
+        canonical = _canonical_product_link(link)
+        roaster_val = fields.get('Roaster')
+        roaster_text = ''
+        roaster_ids = []
+        if isinstance(roaster_val, list):
+            roaster_ids = [str(v) for v in roaster_val]
+            roaster_text = ' '.join(roaster_ids)
+        elif roaster_val is not None:
+            roaster_text = str(roaster_val)
+        existing_by_link[canonical] = {
+            'id': rec['id'],
+            'roaster_text': roaster_text,
+            'roaster_ids': roaster_ids,
+        }
+
+    print(f'\n——— {roaster_name} ({store_url}) [WordPress HTML] ———')
+    print('Discovering product URLs from sitemaps...')
+    urls = get_product_urls_from_wordpress_sitemaps(store_url)
+    print(f'Found {len(urls)} product URL(s) in sitemaps. Fetching & filtering...\n')
+
+    # For Woo/Shopify + WordPress combined runs, the primary pass has already upserted
+    # canonical rows and may pass them in woo_seen_links. Do not replace in that case.
+    if REPLACE_ROASTER_PRODUCTS_EACH_RUN and not woo_seen_links:
+        replace_existing_products_for_roaster(roaster_name, roaster_airtable_id, existing_by_link)
+
+    seen_links = set(woo_seen_links)
+    processed_wp = set()
+
+    for page_url in urls:
+        html_text = fetch_page_html(page_url)
+        if not html_text:
+            continue
+        _require_bs4()
+        try:
+            soup = BeautifulSoup(html_text, 'lxml')
+        except Exception:
+            soup = BeautifulSoup(html_text, 'html.parser')
+        cat_text = _wordpress_collect_category_text(soup)
+
+        name = ''
+        og = soup.find('meta', property='og:title')
+        if og and og.get('content'):
+            name = _html_stdlib.unescape(og['content'].strip())
+        if not name:
+            h1 = soup.find('h1', class_=re.compile('product_title')) or soup.find('h1')
+            if h1:
+                name = _html_stdlib.unescape(h1.get_text(' ', strip=True))
+
+        name = _strip_wordpress_seo_title_suffix(name, roaster_name)
+
+        if not wordpress_product_passes_html_filters(name, html_text, cat_text):
+            continue
+
+        wp_rec = parse_wordpress_product_html(page_url, html_text, roaster_name, roaster_airtable_id)
+        if not wp_rec or not wp_rec.get('Product Link'):
+            continue
+
+        canonical = wp_rec['Product Link']
+        processed_wp.add(canonical)
+        seen_links.add(canonical)
+
+        if canonical in woo_records_by_link:
+            record = merge_woo_primary_record(woo_records_by_link[canonical], wp_rec)
+            label = '[Woo+WP merge] '
+        else:
+            record = wp_rec
+            label = '[WP] '
+
+        entry = existing_by_link.get(canonical)
+        existing_id = entry['id'] if entry else None
+
+        try:
+            if DRY_RUN:
+                if existing_id:
+                    print(f'  [DRY_RUN] 🔁 Would update {label}{record.get("Product Name")}')
+                else:
+                    print(f'  [DRY_RUN] ✅ Would add {label}{record.get("Product Name")}')
+            else:
+                if existing_id:
+                    products_table.update(existing_id, record, typecast=True)
+                    print(f'  🔁 {label}{record.get("Product Name")}')
+                else:
+                    created = products_table.create(record, typecast=True)
+                    existing_by_link[canonical] = {
+                        'id': created['id'],
+                        'roaster_text': roaster_name,
+                        'roaster_ids': [str(roaster_airtable_id)] if roaster_airtable_id else [],
+                    }
+                    print(f'  ✅ {label}{record.get("Product Name")}')
+        except Exception as e:
+            print(f'  ❌ {label}{record.get("Product Name")}: {e}')
+
+    if not defer_delete:
+        delete_obsolete_products_for_roaster(roaster_name, roaster_airtable_id, seen_links, existing_by_link)
+
+    print('\nDone with WordPress HTML pass.')
+    return {'seen_links': seen_links, 'existing_by_link': existing_by_link, 'wp_only_links': processed_wp - set(woo_seen_links)}
+
+
+def woo_product_to_record(p, roaster_display_name, roaster_airtable_id=None):
+    """Map one WooCommerce Store API product to the same Airtable record shape as Shopify."""
+    import html as _html
+    name = _html.unescape(p.get('name') or '')
+    # Some Woo themes include "Product - Roaster Name" style suffixes in the Woo title.
+    name = _strip_wordpress_seo_title_suffix(name, roaster_display_name)
+    permalink = p.get('permalink') or ''
+    product_link = _canonical_product_link(permalink)
+    desc = p.get('description') or ''
+    short_desc = p.get('short_description') or ''
+    tags_list = [t.get('name', '') for t in (p.get('tags') or [])]
+    search_text = name + ' ' + desc + ' ' + short_desc + ' ' + ' '.join(tags_list)
+
+    # Sizes and grinds from attributes (e.g. "Coffee Bag Size", "Grind")
+    sizes_raw = []
+    grinds_raw = []
+    for attr in p.get('attributes') or []:
+        attr_name = (attr.get('name') or '').lower()
+        terms = attr.get('terms') or []
+        values = [t.get('name') or t.get('slug', '') for t in terms]
+        if 'size' in attr_name or 'weight' in attr_name or 'bag' in attr_name:
+            sizes_raw.extend(values)
+        elif option_name_is_grind_or_bean_type(attr_name):
+            grinds_raw.extend(values)
+    # Also from variations (value might be "12-oz" -> normalize to "12 oz")
+    for v in p.get('variations') or []:
+        for a in v.get('attributes') or []:
+            an = (a.get('name') or '').lower()
+            val = a.get('value') or ''
+            val = val.replace('-', ' ').strip()
+            if 'size' in an or 'weight' in an or 'bag' in an:
+                sizes_raw.append(val)
+            elif option_name_is_grind_or_bean_type(an):
+                grinds_raw.append(val)
+
+    final_roast = get_roast_level(search_text)
+    final_origins = get_origins(search_text)
+    final_quantities = get_quantities(sizes_raw)
+    final_types = get_types(grinds_raw)
+    if not final_types:
+        final_types = ['Whole Bean']
+
+    # Generic HTML structured-field fallback (platform-agnostic):
+    # Use only when JSON-derived values are missing/weak.
+    if permalink and (
+        final_origins == ['Global'] or final_roast is None or not final_quantities or final_types == ['Whole Bean']
+    ):
+        html_text = fetch_page_html(permalink)
+        extracted = extract_structured_fields_from_html(html_text)
+        if extracted:
+            if final_origins == ['Global'] and extracted.get('origin_text'):
+                o2 = get_origins(extracted['origin_text'])
+                if o2 and o2 != ['Global']:
+                    final_origins = o2
+            if final_roast is None and extracted.get('roast_text'):
+                r2 = get_roast_level(extracted['roast_text'])
+                if r2:
+                    final_roast = r2
+            if not final_quantities and extracted.get('quantity_texts'):
+                q2 = get_quantities(extracted.get('quantity_texts') or [])
+                if q2:
+                    final_quantities = q2
+            # Upgrade type if HTML shows grind options indicating ground
+            if extracted.get('grind_text'):
+                t2 = get_types([extracted['grind_text']])
+                if t2:
+                    final_types = sorted(list(set(final_types + t2)))
+
+    if roaster_airtable_id:
+        roaster_value = [roaster_airtable_id]
+    else:
+        roaster_value = [roaster_display_name]
+
+    record = {
+        'Product Name': name,
+        'Roaster': roaster_value,
+        'Product Link': product_link or permalink,
+        'Origin': final_origins,
+        'Quantity': final_quantities,
+        'Type': final_types,
+    }
+    if final_roast:
+        record['Roast Level'] = final_roast
+
+    images = p.get('images') or []
+    if images and images[0]:
+        src = images[0].get('src')
+        if src:
+            record['Product Image'] = [{'url': src}]
+
+    return record
+
+
+def fetch_and_push_for_roaster(roaster_name, store_url, roaster_airtable_id=None, defer_delete=False):
+    """
+    Fetch, filter and upsert products for a single WooCommerce roaster.
+    Intended to be called from the global orchestration code.
+
+    If defer_delete is True, obsolete rows are not deleted here; caller should combine
+    seen_links with the WordPress pass, then call delete_obsolete_products_for_roaster.
+
+    Returns:
+      - None if defer_delete is False (default).
+      - dict with keys: seen_links (set), records_by_link (dict canonical -> record), existing_by_link
+        if defer_delete is True.
+    """
+    # Load all existing records once (for upsert + roaster-specific delete).
+    existing_by_link = {}
+    for rec in products_table.all(fields=['Product Link', 'Roaster']):
+        fields = rec.get('fields', {})
+        link = fields.get('Product Link')
+        if not link:
+            continue
+        canonical = _canonical_product_link(link)
+        roaster_val = fields.get('Roaster')
+        roaster_text = ''
+        roaster_ids = []
+        if isinstance(roaster_val, list):
+            roaster_ids = [str(v) for v in roaster_val]
+            roaster_text = ' '.join(roaster_ids)
+        elif roaster_val is not None:
+            roaster_text = str(roaster_val)
+        existing_by_link[canonical] = {
+            'id': rec['id'],
+            'roaster_text': roaster_text,
+            'roaster_ids': roaster_ids,
+        }
+
+    print(f'\n——— {roaster_name} ({store_url}) [WooCommerce] ———')
+    print('Discovering products from WooCommerce sitemap/API...')
+    all_products = fetch_all_woo_products(store_url)
+    print(f'Retrieved {len(all_products)} product(s). Filtering...')
+    coffee_products = [p for p in all_products if woo_product_passes_filters(p)]
+    print(f'Found {len(coffee_products)} coffee product(s). Pushing to Airtable...\n')
+
+    if REPLACE_ROASTER_PRODUCTS_EACH_RUN:
+        replace_existing_products_for_roaster(roaster_name, roaster_airtable_id, existing_by_link)
+
+    seen_links = set()
+    records_by_link = {}
+    for p in coffee_products:
+        import html as _html
+        name = _html.unescape(p.get('name') or '')
+        record = woo_product_to_record(p, roaster_name, roaster_airtable_id)
+        product_link = record.get('Product Link')
+        if not product_link:
+            print(f'  ⚠ Skipped {name} (missing link).')
+            continue
+        seen_links.add(product_link)
+        records_by_link[product_link] = record
+        entry = existing_by_link.get(product_link)
+        existing_id = entry['id'] if entry else None
+
+        try:
+            if DRY_RUN:
+                if existing_id:
+                    print(f'  [DRY_RUN] 🔁 Would update: {name}')
+                else:
+                    print(f'  [DRY_RUN] ✅ Would add: {name}')
+            else:
+                if existing_id:
+                    products_table.update(existing_id, record, typecast=True)
+                    print(f'  🔁 Updated: {name}')
+                else:
+                    created = products_table.create(record, typecast=True)
+                    rid = str(roaster_airtable_id) if roaster_airtable_id else ''
+                    existing_by_link[product_link] = {
+                        'id': created['id'],
+                        'roaster_text': roaster_name,
+                        'roaster_ids': [rid] if rid else [],
+                    }
+                    print(f'  ✅ Added: {name}')
+        except Exception as e:
+            print(f'  ❌ Failed {name}: {e}')
+
+    if defer_delete:
+        print('\nDone with WooCommerce roaster (delete deferred for combined WordPress pass).')
+        return {
+            'seen_links': seen_links,
+            'records_by_link': records_by_link,
+            'existing_by_link': existing_by_link,
+        }
+
+    # Delete obsolete records for this roaster only
+    delete_obsolete_products_for_roaster(roaster_name, roaster_airtable_id, seen_links, existing_by_link)
+
+    print('\nDone with WooCommerce roaster.')
+    return None
+
+
+def product_to_record(product, store_url, roaster_display_name, roaster_airtable_id=None):
+    """Build Airtable record from Shopify product.
+    Uses store_url and roaster_display_name for this roaster.
+    If roaster_airtable_id is provided, the Roaster field links directly by ID.
+    """
+    title = product.get('title')
+    # Some Shopify themes include "Product — Roaster Name" in og:title.
+    # Strip the trailing roaster name suffix to keep Product Name clean.
+    title = _strip_wordpress_seo_title_suffix(title, roaster_display_name)
+    handle = product.get('handle')
+    product_url = f'{store_url}/products/{handle}'
+    vendor_raw = product.get('vendor', '')
+
+    raw_description = product.get('body_html', '') or ''
+    tags_list = product.get('tags', [])
+
+    # 1) Prefer origins found in the product TITLE itself (e.g. "... - Colombia").
+    title_text = title or ''
+    title_origins = get_origins(title_text)
+
+    # get_origins always returns at least ['Global'], so check for any real country
+    has_real_title_origin = any(o != 'Global' for o in title_origins)
+
+    # 2) Build full search text for fallback origin/roast detection
+    search_text = title_text + ' ' + raw_description + ' ' + ' '.join(tags_list)
+
+    sizes_raw = []
+    grinds_raw = []
+    for opt in product.get('options', []):
+        opt_name = (opt.get('name') or '').lower()
+        if 'size' in opt_name or 'weight' in opt_name:
+            sizes_raw.extend(opt.get('values', []))
+        # Shopify merchants often label this "Bean type" / "Bean Type" instead of "Grind"
+        elif option_name_is_grind_or_bean_type(opt_name):
+            grinds_raw.extend(opt.get('values', []))
+
+    # Decide Roaster field: prefer explicit Airtable ID when available
+    if roaster_airtable_id:
+        roaster_value = [roaster_airtable_id]
+    else:
+        final_roaster = get_roaster_display(vendor_raw, roaster_display_name)
+        roaster_value = [final_roaster]
+    final_roast = get_roast_level(search_text)
+    # If we found any real origin in the title, trust that list.
+    # Otherwise, fall back to the existing description + tags based detection.
+    if has_real_title_origin:
+        final_origins = [o for o in title_origins if o != 'Global']
+    else:
+        final_origins = get_origins(search_text)
+    final_quantities = get_quantities(sizes_raw)
+    final_types = get_types(grinds_raw)
+    # If we couldn't infer type from grind options, default to Whole Bean so Type is never blank.
+    if not final_types:
+        final_types = ['Whole Bean']
+
+    # Generic HTML structured-field fallback (platform-agnostic):
+    # Use only when JSON-derived values are missing/weak.
+    if product_url and (
+        final_origins == ['Global'] or final_roast is None or not final_quantities or final_types == ['Whole Bean']
+    ):
+        html_text = fetch_page_html(product_url)
+        extracted = extract_structured_fields_from_html(html_text)
+        if extracted:
+            if final_origins == ['Global'] and extracted.get('origin_text'):
+                o2 = get_origins(extracted['origin_text'])
+                if o2 and o2 != ['Global']:
+                    final_origins = o2
+            if final_roast is None and extracted.get('roast_text'):
+                r2 = get_roast_level(extracted['roast_text'])
+                if r2:
+                    final_roast = r2
+            if not final_quantities and extracted.get('quantity_texts'):
+                q2 = get_quantities(extracted.get('quantity_texts') or [])
+                if q2:
+                    final_quantities = q2
+            if extracted.get('grind_text'):
+                t2 = get_types([extracted['grind_text']])
+                if t2:
+                    final_types = sorted(list(set(final_types + t2)))
+
+        # Tandem-specific origin extraction: origin line under the title
+        # Only run if origin is still Global and this roaster is Tandem.
+        if final_origins == ['Global'] and 'tandem' in (roaster_display_name or '').lower():
+            soup = None
+            try:
+                soup = BeautifulSoup(html_text, 'lxml') if html_text else None
+            except Exception:
+                soup = BeautifulSoup(html_text, 'html.parser') if html_text else None
+            if soup:
+                # Find the main product title h1
+                h1 = soup.find('h1')
+                if h1:
+                    # Look at a few nearby siblings for a short origin line
+                    for sib in h1.find_all_next(limit=5):
+                        text = sib.get_text(' ', strip=True) if hasattr(sib, 'get_text') else ''
+                        if not text:
+                            continue
+                        o2 = get_origins(text)
+                        if o2 and o2 != ['Global']:
+                            final_origins = o2
+                            break
+
+    record = {
+        'Product Name': title,
+        'Roaster': roaster_value,
+        'Product Link': product_url,
+        'Origin': final_origins,
+        'Quantity': final_quantities,
+        'Type': final_types,
+    }
+    if final_roast:
+        record['Roast Level'] = final_roast
+
+    images = product.get('images') or []
+    if images and images[0]:
+        src = images[0].get('src')
+        if src:
+            record['Product Image'] = [{'url': src}]
+
+    return record
+
+
+def run_for_all_roasters():
+    roasters = get_roasters_from_airtable()
+    if not roasters:
+        print('No roasters found in the roasters table. Check table name and field names.')
+        return {'shopify': [], 'woocommerce': [], 'unknown': []}
+
+    # Optional filter (useful for dry runs): only keep roasters matching the base_url substring
+    if DRY_RUN and ROASTER_BASE_URL_SUBSTRING_FILTER:
+        roasters = [
+            r for r in roasters
+            if (r.get('base_url') or '').lower().find(ROASTER_BASE_URL_SUBSTRING_FILTER.lower()) != -1
+        ]
+        if not roasters:
+            print(f'[DRY_RUN] No roasters matched filter substring: {ROASTER_BASE_URL_SUBSTRING_FILTER}')
+            return {'shopify': [], 'woocommerce': [], 'squarespace': [], 'wordpress': [], 'unknown': []}
+
+    # Determine platform per roaster:
+    # - Prefer the manual "Platform Used" value when present
+    # - Otherwise fall back to automatic detection
+    shopify_roasters = []
+    woocommerce_roasters = []
+    squarespace_roasters = []
+    wordpress_roasters = []
+    unknown_roasters = []
+    for r in roasters:
+        manual = (r.get('platform_used') or '').strip().lower()
+        if manual == 'shopify':
+            platform = 'shopify'
+        elif manual in ('woocommerce', 'woocommerce', 'woo commerce', 'woo-commerce'):
+            platform = 'woocommerce'
+        elif manual in ('squarespace', 'square space', 'square-space'):
+            platform = 'squarespace'
+        else:
+            platform = detect_platform(r['base_url'])
+        r['platform'] = platform
+        if platform == 'shopify':
+            shopify_roasters.append(r)
+        elif platform == 'woocommerce':
+            woocommerce_roasters.append(r)
+        elif platform == 'squarespace':
+            squarespace_roasters.append(r)
+        else:
+            unknown_roasters.append(r)
+
+        # Independently check for WordPress traces; if found, also mark for WordPress scraping.
+        try:
+            if is_wordpress_site(r['base_url']):
+                wordpress_roasters.append(r)
+        except Exception:
+            pass
+
+    # Load all existing product records once (for upsert + safe delete for Shopify stores)
+    existing_by_link = {}
+    wordpress_id_set = set([str(r.get('id')) for r in wordpress_roasters if r.get('id')])
+    shopify_pass_results_by_id = {}
+    for rec in products_table.all(fields=['Product Link', 'Roaster']):
+        fields = rec.get('fields', {})
+        link = fields.get('Product Link')
+        if not link:
+            continue
+        roaster_val = fields.get('Roaster')
+        roaster_text = ''
+        roaster_ids = []
+        if isinstance(roaster_val, list):
+            roaster_ids = [str(v) for v in roaster_val]
+            roaster_text = ' '.join(roaster_ids)
+        elif roaster_val is not None:
+            roaster_text = str(roaster_val)
+        existing_by_link[link] = {
+            'id': rec['id'],
+            'roaster_display': roaster_text,
+            'roaster_ids': roaster_ids,
+        }
+
+    # Process only Shopify roasters with the Shopify scraper
+    for roaster in shopify_roasters:
+        name = roaster['name']
+        store_url = roaster['base_url']
+        roaster_id = roaster.get('id')
+        print(f"\n——— {name} ({store_url}) [Shopify] ———")
+        print('Discovering products from sitemap...')
+        coffee_products = get_all_coffee_products_for_store(store_url, name, roaster_id)
+        print(f"Found {len(coffee_products)} coffee product(s). Upserting...\n")
+
+        # Optional "clobber then insert" mode: remove this roaster's current rows before
+        # recreating the freshly scraped set so records stay grouped together in Airtable.
+        if REPLACE_ROASTER_PRODUCTS_EACH_RUN:
+            links_to_replace = [
+                link for link, meta in existing_by_link.items()
+                if (
+                    (roaster_id and roaster_id in meta.get('roaster_ids', []))
+                    or roaster_display_matches(meta.get('roaster_display', ''), name)
+                )
+            ]
+            if links_to_replace:
+                print(f"  Replacing {len(links_to_replace)} existing record(s) for {name}...")
+                if DRY_RUN:
+                    print(f'  [DRY_RUN] Would delete {len(links_to_replace)} existing record(s) before re-add.')
+                else:
+                    ids_to_delete = [existing_by_link[link]['id'] for link in links_to_replace]
+                    for i in range(0, len(ids_to_delete), 10):
+                        batch = ids_to_delete[i : i + 10]
+                        try:
+                            products_table.batch_delete(batch)
+                            print(f"  🗑️ Deleted {len(batch)} record(s) for replace mode.")
+                        except Exception as e:
+                            print(f"  ❌ Replace-mode batch delete failed: {e}")
+                            for rid in batch:
+                                try:
+                                    products_table.delete(rid)
+                                    print("  🗑️ Deleted 1 record (replace fallback).")
+                                except Exception as e2:
+                                    msg = str(e2)
+                                    if 'NOT_FOUND' in msg or '404' in msg:
+                                        print("  ℹ️ Skip missing record (replace fallback).")
+                                    else:
+                                        print(f"  ❌ Replace fallback delete failed: {e2}")
+                for link in links_to_replace:
+                    existing_by_link.pop(link, None)
+
+        seen_links = set()
+        seen_links_canonical = set()
+        records_by_link_canonical = {}
+        for product in coffee_products:
+            title = product.get('title')
+            record = product_to_record(product, store_url, name, roaster_airtable_id=name and roaster.get('id'))
+            product_link = record.get('Product Link')
+            if not product_link:
+                continue
+            seen_links.add(product_link)
+            canonical_link = _canonical_product_link(product_link)
+            seen_links.add(canonical_link)
+            seen_links_canonical.add(canonical_link)
+            records_by_link_canonical[canonical_link] = record
+            entry = existing_by_link.get(product_link)
+            existing_id = entry['id'] if entry else None
+
+            try:
+                if DRY_RUN:
+                    if existing_id:
+                        print(f"  [DRY_RUN] 🔁 Would update: {title}")
+                    else:
+                        print(f"  [DRY_RUN] ✅ Would add: {title}")
+                else:
+                    if existing_id:
+                        products_table.update(existing_id, record, typecast=True)
+                        print(f"  🔁 Updated: {title}")
+                    else:
+                        created = products_table.create(record, typecast=True)
+                        existing_by_link[product_link] = {
+                            'id': created['id'],
+                            'roaster_display': name,
+                            'roaster_ids': [str(roaster_id)] if roaster_id else [],
+                        }
+                        print(f"  ✅ Added: {title}")
+            except Exception as e:
+                print(f"  ❌ Failed {title}: {e}")
+
+        # Delete only this roaster's records that are no longer on the site
+        # If WordPress is also detected for this roaster, we defer deletion.
+        # The WordPress pass will delete using the union of Woo/Shopify + WordPress links.
+        if roaster_id and str(roaster_id) in wordpress_id_set:
+            shopify_pass_results_by_id[str(roaster_id)] = {
+                'seen_links': seen_links_canonical,
+                'records_by_link': records_by_link_canonical,
+            }
+        else:
+            links_to_delete = [
+                link for link, meta in existing_by_link.items()
+                if (
+                    (roaster_id and roaster_id in meta.get('roaster_ids', []))
+                    or roaster_display_matches(meta['roaster_display'], name)
+                ) and link not in seen_links
+            ]
+            if links_to_delete:
+                print(f"\n  Deleting {len(links_to_delete)} obsolete record(s) for {name}...")
+                if DRY_RUN:
+                    print(f'  [DRY_RUN] Would delete {len(links_to_delete)} record(s).')
+                    shopify_pass_results_by_id[str(roaster_id)] = {
+                        'seen_links': seen_links_canonical,
+                        'records_by_link': records_by_link_canonical,
+                    }
+                    continue
+                ids_to_delete = [existing_by_link[link]['id'] for link in links_to_delete]
+                for i in range(0, len(ids_to_delete), 10):
+                    batch = ids_to_delete[i : i + 10]
+                    try:
+                        products_table.batch_delete(batch)
+                        print(f"  🗑️ Deleted {len(batch)} record(s).")
+                    except Exception as e:
+                        print(f"  ❌ Batch delete failed: {e}")
+                        # Airtable batch_delete fails the whole request if *any* record ID
+                        # in the batch is missing. Retry individually so we still clean up
+                        # the IDs that do exist.
+                        for rid in batch:
+                            try:
+                                products_table.delete(rid)
+                                print("  🗑️ Deleted 1 record (fallback).")
+                            except Exception as e2:
+                                msg = str(e2)
+                                if 'NOT_FOUND' in msg or '404' in msg:
+                                    print("  ℹ️ Skip missing record (fallback).")
+                                else:
+                                    print(f"  ❌ Fallback delete failed: {e2}")
+            shopify_pass_results_by_id[str(roaster_id)] = {
+                'seen_links': seen_links_canonical,
+                'records_by_link': records_by_link_canonical,
+            }
+
+    print('\nDone with Shopify roasters.')
+    return {
+        'shopify': shopify_roasters,
+        'woocommerce': woocommerce_roasters,
+        'squarespace': squarespace_roasters,
+        'wordpress': wordpress_roasters,
+        'unknown': unknown_roasters,
+        'shopify_pass_results_by_id': shopify_pass_results_by_id,
+    }
+
+
+if __name__ == '__main__':
+    # Run scrapers for all roasters listed in Roaster Information,
+    # automatically routing Shopify/WooCommerce/Squarespace based on platform detection.
+    platforms = run_for_all_roasters()
+
+    woocommerce_roasters = platforms.get('woocommerce', []) if platforms else []
+    squarespace_roasters = platforms.get('squarespace', []) if platforms else []
+    shopify_roasters = platforms.get('shopify', []) if platforms else []
+    wordpress_roasters = platforms.get('wordpress', []) if platforms else []
+    shopify_pass_results_by_id = platforms.get('shopify_pass_results_by_id', {}) if platforms else {}
+
+    # Match by normalized host so https://cutbowcoffee.com matches https://www.cutbowcoffee.com
+    wordpress_base_set = set(
+        _canonical_roaster_host(r.get('base_url'))
+        for r in wordpress_roasters
+        if _canonical_roaster_host(r.get('base_url'))
+    )
+
+    def is_wordpress_trace(roaster):
+        h = _canonical_roaster_host(roaster.get('base_url'))
+        return bool(h and h in wordpress_base_set)
+
+    # 1) WooCommerce: always run the WordPress HTML pass after the Store API pass.
+    # WooCommerce stores run on WordPress; the HTML/sitemap pass discovers URLs the Store API
+    # often misses (e.g. Cutbow). We do not rely on is_wordpress_site() for this path.
+    for r in woocommerce_roasters:
+        print(f"\nRouting {r['name']} ({r['base_url']}) to WooCommerce scraper...")
+        try:
+            woo_res = fetch_and_push_for_roaster(
+                roaster_name=r['name'],
+                store_url=r['base_url'],
+                roaster_airtable_id=r['id'],
+                defer_delete=True,
+            )
+            fetch_and_push_wordpress_for_roaster(
+                roaster_name=r['name'],
+                store_url=r['base_url'],
+                roaster_airtable_id=r['id'],
+                woo_seen_links=woo_res.get('seen_links', set()),
+                woo_records_by_link=woo_res.get('records_by_link', {}),
+                defer_delete=False,
+            )
+        except Exception as e:
+            print(f"\n⚠️ Skipping roaster {r['name']} due to error: {e}")
+
+    # 2) Shopify primary pass already happened inside run_for_all_roasters.
+    #    If WordPress traces exist too, run the WordPress HTML pass after Shopify,
+    #    using Shopify results as the primary source and deferring deletions in Shopify.
+    for r in shopify_roasters:
+        if not is_wordpress_trace(r):
+            continue
+        roaster_id = r.get('id')
+        primary = shopify_pass_results_by_id.get(str(roaster_id), {})
+        try:
+            fetch_and_push_wordpress_for_roaster(
+                roaster_name=r['name'],
+                store_url=r['base_url'],
+                roaster_airtable_id=roaster_id,
+                woo_seen_links=primary.get('seen_links', set()),
+                woo_records_by_link=primary.get('records_by_link', {}),
+                defer_delete=False,
+            )
+        except Exception as e:
+            print(f"\n⚠️ Skipping roaster {r['name']} due to error: {e}")
+
+    # 3) Squarespace roasters run the generic Squarespace HTML/sitemap pass.
+    for r in squarespace_roasters:
+        print(f"\nRouting {r['name']} ({r['base_url']}) to Squarespace scraper...")
+        try:
+            fetch_and_push_squarespace_for_roaster(
+                roaster_name=r['name'],
+                store_url=r['base_url'],
+                roaster_airtable_id=r.get('id'),
+            )
+        except Exception as e:
+            print(f"\n⚠️ Skipping roaster {r['name']} due to error: {e}")
+
+    # Log any roasters where platform could not be determined
+    unknown_roasters = platforms.get('unknown', []) if platforms else []
+    for r in unknown_roasters:
+        print(f"\n⚠️ Platform unknown for {r['name']} ({r['base_url']}). Skipping.")
