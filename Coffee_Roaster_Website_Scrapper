@@ -1293,18 +1293,26 @@ def get_product_slugs_from_woo_sitemap(store_url):
             continue
         if r.status_code != 200:
             continue
-        # Parse XML <loc> if present
-        for loc in _loc_urls_from_sitemap_xml(r.text):
-            for pattern in [r'/shop/([^/?]+)', r'/product/([^/?]+)']:
-                m = __import__('re').search(pattern, loc)
-                if m:
-                    slugs.add(m.group(1).rstrip('/'))
-                    break
-        # Also scan raw text (sitemap may be served as HTML by some hosts)
-        for m in __import__('re').finditer(r'/(?:shop|product)/([a-zA-Z0-9_.-]+)', r.text):
-            slug = m.group(1).rstrip('/')
-            if slug and slug != 'shop':
-                slugs.add(slug)
+        # Parse XML <loc> if present.
+        # Product permalinks may be nested under one or more category folders
+        # (e.g. /shop/category/subcategory/product-slug/). The WooCommerce Store
+        # API matches on the product slug, which is the LAST path segment -- not
+        # the first segment after /shop/.
+        locs = _loc_urls_from_sitemap_xml(r.text)
+        for loc in locs:
+            if '/shop/' not in loc and '/product/' not in loc:
+                continue
+            path = re.split(r'[?#]', loc)[0].rstrip('/')
+            last = path.rsplit('/', 1)[-1]
+            if last and last not in ('shop', 'product'):
+                slugs.add(last)
+        # Fallback: some hosts serve the sitemap as HTML with no <loc> tags.
+        # Scan raw text, capturing the last path segment of each product link.
+        if not locs:
+            for m in re.finditer(r'/(?:shop|product)/(?:[a-zA-Z0-9_.-]+/)*([a-zA-Z0-9_.-]+)/?', r.text):
+                slug = m.group(1).rstrip('/')
+                if slug and slug not in ('shop', 'product'):
+                    slugs.add(slug)
 
     return list(slugs)
 
