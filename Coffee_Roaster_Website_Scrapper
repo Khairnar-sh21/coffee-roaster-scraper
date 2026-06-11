@@ -2030,8 +2030,10 @@ def fetch_and_push_squarespace_for_roaster(roaster_name, store_url, roaster_airt
     urls = get_product_urls_from_squarespace_sitemaps(store_url)
     print(f'Found {len(urls)} product URL(s). Fetching & filtering...\n')
 
-    if REPLACE_ROASTER_PRODUCTS_EACH_RUN:
+    if REPLACE_ROASTER_PRODUCTS_EACH_RUN and urls:
         replace_existing_products_for_roaster(roaster_name, roaster_airtable_id, existing_by_link)
+    elif REPLACE_ROASTER_PRODUCTS_EACH_RUN and not urls:
+        print(f'  ⚠️ Skipping replace for {roaster_name}: found 0 product URLs (possible block/error); existing rows preserved.')
 
     seen_links = set()
     for page_url in urls:
@@ -2086,7 +2088,10 @@ def fetch_and_push_squarespace_for_roaster(roaster_name, store_url, roaster_airt
         except Exception as e:
             print(f'  ❌ Failed {rec.get("Product Name")}: {e}')
 
-    delete_obsolete_products_for_roaster(roaster_name, roaster_airtable_id, seen_links, existing_by_link)
+    if seen_links:
+        delete_obsolete_products_for_roaster(roaster_name, roaster_airtable_id, seen_links, existing_by_link)
+    else:
+        print(f'  ⚠️ Skipping delete for {roaster_name}: scrape returned 0 products (possible block/error); existing rows preserved.')
     print('\nDone with Squarespace roaster.')
 
 
@@ -2217,7 +2222,7 @@ def fetch_and_push_wordpress_for_roaster(
 
     # For Woo/Shopify + WordPress combined runs, the primary pass has already upserted
     # canonical rows and may pass them in woo_seen_links. Do not replace in that case.
-    if REPLACE_ROASTER_PRODUCTS_EACH_RUN and not woo_seen_links:
+    if REPLACE_ROASTER_PRODUCTS_EACH_RUN and not woo_seen_links and urls:
         replace_existing_products_for_roaster(roaster_name, roaster_airtable_id, existing_by_link)
 
     seen_links = set(woo_seen_links)
@@ -2287,8 +2292,10 @@ def fetch_and_push_wordpress_for_roaster(
         except Exception as e:
             print(f'  ❌ {label}{record.get("Product Name")}: {e}')
 
-    if not defer_delete:
+    if not defer_delete and seen_links:
         delete_obsolete_products_for_roaster(roaster_name, roaster_airtable_id, seen_links, existing_by_link)
+    elif not defer_delete and not seen_links:
+        print(f'  ⚠️ Skipping delete for {roaster_name}: scrape returned 0 products (possible block/error); existing rows preserved.')
 
     print('\nDone with WordPress HTML pass.')
     return {'seen_links': seen_links, 'existing_by_link': existing_by_link, 'wp_only_links': processed_wp - set(woo_seen_links)}
@@ -2429,8 +2436,14 @@ def fetch_and_push_for_roaster(roaster_name, store_url, roaster_airtable_id=None
     coffee_products = [p for p in all_products if woo_product_passes_filters(p)]
     print(f'Found {len(coffee_products)} coffee product(s). Pushing to Airtable...\n')
 
-    if REPLACE_ROASTER_PRODUCTS_EACH_RUN:
+    # Failsafe: only clobber existing rows if this run actually retrieved products.
+    # A zero result almost always means the site blocked/errored us (e.g. Cloudflare
+    # blocking a cloud IP), not that the roaster truly has no products -- so we
+    # preserve the existing rows instead of wiping them.
+    if REPLACE_ROASTER_PRODUCTS_EACH_RUN and all_products:
         replace_existing_products_for_roaster(roaster_name, roaster_airtable_id, existing_by_link)
+    elif REPLACE_ROASTER_PRODUCTS_EACH_RUN and not all_products:
+        print(f'  ⚠️ Skipping replace for {roaster_name}: fetch returned 0 products (possible block/error); existing rows preserved.')
 
     seen_links = set()
     records_by_link = {}
@@ -2477,8 +2490,12 @@ def fetch_and_push_for_roaster(roaster_name, store_url, roaster_airtable_id=None
             'existing_by_link': existing_by_link,
         }
 
-    # Delete obsolete records for this roaster only
-    delete_obsolete_products_for_roaster(roaster_name, roaster_airtable_id, seen_links, existing_by_link)
+    # Delete obsolete records for this roaster only. Skip when nothing was scraped,
+    # which usually means the site blocked us rather than truly having no products.
+    if seen_links:
+        delete_obsolete_products_for_roaster(roaster_name, roaster_airtable_id, seen_links, existing_by_link)
+    else:
+        print(f'  ⚠️ Skipping delete for {roaster_name}: scrape returned 0 products (possible block/error); existing rows preserved.')
 
     print('\nDone with WooCommerce roaster.')
     return None
@@ -2692,7 +2709,7 @@ def run_for_all_roasters():
 
         # Optional "clobber then insert" mode: remove this roaster's current rows before
         # recreating the freshly scraped set so records stay grouped together in Airtable.
-        if REPLACE_ROASTER_PRODUCTS_EACH_RUN:
+        if REPLACE_ROASTER_PRODUCTS_EACH_RUN and coffee_products:
             links_to_replace = [
                 link for link, meta in existing_by_link.items()
                 if (
@@ -2779,7 +2796,9 @@ def run_for_all_roasters():
                     (roaster_id and roaster_id in meta.get('roaster_ids', []))
                     or roaster_display_matches(meta['roaster_display'], name)
                 ) and link not in seen_links
-            ]
+            ] if coffee_products else []
+            if not coffee_products:
+                print(f"  ⚠️ Skipping delete for {name}: scrape returned 0 products (possible block/error); existing rows preserved.")
             if links_to_delete:
                 print(f"\n  Deleting {len(links_to_delete)} obsolete record(s) for {name}...")
                 if DRY_RUN:
